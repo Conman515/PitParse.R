@@ -458,7 +458,7 @@ server <- function(input, output, session) {
     pick <- open_wb_and_pick_sheet(path, site_code)
     if (!is.null(pick$error)) return(list(ok=FALSE, row_index=NA_integer_, sheet=site_code, msg=pick$error))
     wb <- pick$wb; sheet <- pick$sheet
-    df0 <- try(openxlsx::readWorkbook(wb, sheet = sheet), silent=TRUE)
+    df0 <- try(openxlsx::readWorkbook(wb, sheet = sheet, check.names = FALSE), silent=TRUE)
     if (inherits(df0, "try-error") || !is.data.frame(df0)) df0 <- data.frame()
     headers_now <- if (ncol(df0)) names(df0) else character(0)
     
@@ -469,7 +469,7 @@ server <- function(input, output, session) {
     # Ensure header has all needed columns (may write header row)
     headers_now <- ensure_header(wb, sheet, headers_now, need_ptagis)
     # Re-read after header normalization
-    df0 <- try(openxlsx::readWorkbook(wb, sheet = sheet), silent=TRUE)
+    df0 <- try(openxlsx::readWorkbook(wb, sheet = sheet, check.names = FALSE), silent=TRUE)
     if (inherits(df0, "try-error") || !is.data.frame(df0)) df0 <- data.frame()
     if (!ncol(df0)) {
       # just header row existed
@@ -1137,7 +1137,7 @@ server <- function(input, output, session) {
     if (has_openxlsx && nzchar(log_path) && file.exists(log_path)) {
       pick <- open_wb_and_pick_sheet(log_path, sel_site)
       if (is.null(pick$error)) {
-        df0 <- try(openxlsx::readWorkbook(pick$wb, sheet = pick$sheet), silent=TRUE)
+        df0 <- try(openxlsx::readWorkbook(pick$wb, sheet = pick$sheet, check.names = FALSE), silent=TRUE)
         if (!inherits(df0, "try-error") && is.data.frame(df0) && ncol(df0)) {
           nm <- names(df0); nn <- norm_name(nm)
           has_pt <- any(nn == "ptagis" | nn == "uploadedptagis" | nn == "uploadedtoptagis")
