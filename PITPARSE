@@ -404,40 +404,25 @@ ui <- fluidPage(
 # ========= SERVER =========
 server <- function(input, output, session) {
   # ---------- Excel helpers tuned to your actual workbook ----------
-  norm_name <- function(x) {
-    tolower(gsub("[^a-z0-9]+","", trimws(as.character(x))))
-  }
-  # Column aliases we accept (left side = normalized canonical; right = accepted aliases)
-  COL_ALIASES <- list(
-    date        = c("date"),
-    personnel   = c("personnel","initials","whouploaded","uploadedby"),
-    downloaded  = c("downloadedyn","downloaded","uploaded","upload"),
-    ptagis      = c("ptagis","uploadedptagis","uploadedtoptagis","ptagisy_n","ptagisy/n","ptagisuploaded"),
-    statusneeds = c("statusneeds","status","status/needs","status_needs"),
-    comments    = c("comments","comment","notes")
-  )
-  # Return a mapping from canonical -> actual column name present (or NA if missing)
-  map_cols <- function(headers) {
-    hnorm <- norm_name(headers)
-    out <- setNames(rep(NA_character_, length(COL_ALIASES)), names(COL_ALIASES))
-    for (can in names(COL_ALIASES)) {
-      aliases <- unique(c(can, COL_ALIASES[[can]]))
-      ix <- match(aliases, hnorm)
-      ix <- ix[!is.na(ix)]
-      if (length(ix)) out[[can]] <- headers[ix[1]]
-    }
-    out
-  }
-  # Ensure header contains all required columns (append missing at end, keep existing order)
+  # Ensure header exists; rely on column position rather than name matching
   ensure_header <- function(wb, sheet, headers_now, need_ptagis) {
-    need <- c("Date","Personnel","Downloaded? (Y/N)","Status/Needs","Comments")
-    if (isTRUE(need_ptagis) && !"Uploaded to PTAGIS?" %in% headers_now) need <- append(need, "Uploaded to PTAGIS?", after=3)
-    missing <- setdiff(need, headers_now)
-    if (!length(missing)) return(headers_now)
-    new_headers <- c(headers_now, missing)
-    openxlsx::writeData(wb, sheet = sheet, x = as.data.frame(setNames(as.list(rep(NA, length(new_headers))), new_headers)),
-                        startCol = 1, startRow = 1, withFilter = FALSE)
-    new_headers
+    if (!length(headers_now)) {
+      headers_now <- c("Date", "Personnel", "Downloaded? (Y/N)",
+                       if (need_ptagis) "Uploaded to PTAGIS?", "Status/Needs", "Comments")
+      openxlsx::writeData(
+        wb, sheet = sheet,
+        x = as.data.frame(setNames(vector("list", length(headers_now)), headers_now)),
+        startCol = 1, startRow = 1, withFilter = FALSE
+      )
+    } else if (need_ptagis && length(headers_now) == 5) {
+      headers_now <- c(headers_now[1:3], "Uploaded to PTAGIS?", headers_now[4:5])
+      openxlsx::writeData(
+        wb, sheet = sheet,
+        x = as.data.frame(setNames(vector("list", length(headers_now)), headers_now)),
+        startCol = 1, startRow = 1, withFilter = FALSE
+      )
+    }
+    headers_now
   }
   # Safe open / sheet pick (case-insensitive match to reuse existing site tab)
   open_wb_and_pick_sheet <- function(path, site_code) {
@@ -461,35 +446,35 @@ server <- function(input, output, session) {
     df0 <- try(openxlsx::readWorkbook(wb, sheet = sheet, check.names = FALSE), silent=TRUE)
     if (inherits(df0, "try-error") || !is.data.frame(df0)) df0 <- data.frame()
     headers_now <- if (ncol(df0)) names(df0) else character(0)
-    
-    # Map existing columns
-    cmap <- map_cols(headers_now)
-    # Decide if PTAGIS should be present (existing or requested)
-    need_ptagis <- (!is.na(cmap["ptagis"])) || isTRUE(force_add_ptagis) || (isTRUE(!is.na(PTagis)) && nzchar(PTagis))
-    # Ensure header has all needed columns (may write header row)
+
+    # Decide if PTAGIS column should be present based on count or user request
+    need_ptagis <- (ncol(df0) >= 6) || isTRUE(force_add_ptagis) ||
+                   (isTRUE(!is.na(PTagis)) && nzchar(PTagis))
+
+    # Ensure header exists / add PTAGIS column by position
     headers_now <- ensure_header(wb, sheet, headers_now, need_ptagis)
-    # Re-read after header normalization
+
+    # Re-read after any header normalization
     df0 <- try(openxlsx::readWorkbook(wb, sheet = sheet, check.names = FALSE), silent=TRUE)
     if (inherits(df0, "try-error") || !is.data.frame(df0)) df0 <- data.frame()
     if (!ncol(df0)) {
-      # just header row existed
-      df0 <- as.data.frame(setNames(as.list(rep(NA, length(headers_now))), headers_now))
-      df0 <- df0[0, , drop=FALSE]
+      df0 <- as.data.frame(setNames(vector("list", length(headers_now)), headers_now))
+      df0 <- df0[0, , drop = FALSE]
     }
-    
-    # Build an aligned named list for the new row
-    new_row <- as.list(rep(NA, length(headers_now))); names(new_row) <- headers_now
-    set_if <- function(cand_names, val) {
-      nm <- intersect(cand_names, names(new_row))
-      if (length(nm)) new_row[[ nm[1] ]] <<- val
+
+    # Build a new row aligned purely by column order
+    new_row <- setNames(vector("list", length(headers_now)), headers_now)
+    new_row[[1]] <- format(as.Date(Date), "%m/%d/%y")
+    new_row[[2]] <- Personnel
+    new_row[[3]] <- Downloaded
+    idx <- 3
+    if (need_ptagis) {
+      idx <- idx + 1
+      new_row[[4]] <- PTagis %||% "N"
     }
-    set_if(c("Date"), format(as.Date(Date), "%m/%d/%y"))
-    set_if(c("Personnel"), Personnel)
-    set_if(c("Downloaded? (Y/N)"), Downloaded)
-    if (need_ptagis) set_if(c("Uploaded to PTAGIS?"), PTagis %||% "N")
-    set_if(c("Status/Needs","Status"), Status)
-    set_if(c("Comments","Comment","Notes"), Comments)
-    
+    new_row[[idx + 1]] <- Status
+    new_row[[idx + 2]] <- Comments
+
     append_df <- as.data.frame(new_row, stringsAsFactors = FALSE)
     start_row <- nrow(df0) + 2  # row 1 header, so first data row = 2
     openxlsx::writeData(wb, sheet = sheet, x = append_df, startRow = start_row, colNames = FALSE, withFilter = FALSE)
@@ -1138,9 +1123,8 @@ server <- function(input, output, session) {
       pick <- open_wb_and_pick_sheet(log_path, sel_site)
       if (is.null(pick$error)) {
         df0 <- try(openxlsx::readWorkbook(pick$wb, sheet = pick$sheet, check.names = FALSE), silent=TRUE)
-        if (!inherits(df0, "try-error") && is.data.frame(df0) && ncol(df0)) {
-          nm <- names(df0); nn <- norm_name(nm)
-          has_pt <- any(nn == "ptagis" | nn == "uploadedptagis" | nn == "uploadedtoptagis")
+        if (!inherits(df0, "try-error") && is.data.frame(df0)) {
+          has_pt <- ncol(df0) >= 6
         }
       }
     }
