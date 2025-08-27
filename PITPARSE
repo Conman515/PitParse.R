@@ -480,9 +480,13 @@ server <- function(input, output, session) {
     append_df <- as.data.frame(new_row, stringsAsFactors = FALSE)
     start_row <- nrow(df0) + 2  # row 1 header, so first data row = 2
     openxlsx::writeData(wb, sheet = sheet, x = append_df, startRow = start_row, colNames = FALSE, withFilter = FALSE)
-    
-    ok <- try(openxlsx::saveWorkbook(wb, file = path, overwrite = TRUE), silent=TRUE)
-    if (inherits(ok, "try-error")) return(list(ok=FALSE, row_index=NA_integer_, sheet=sheet, msg="Save failed (file open/locked or permission denied)"))
+
+    ok <- try({
+      openxlsx::saveWorkbook(wb, file = path, overwrite = TRUE)
+      file.exists(path)
+    }, silent = TRUE)
+    if (inherits(ok, "try-error") || !isTRUE(ok))
+      return(list(ok=FALSE, row_index=NA_integer_, sheet=sheet, msg="Save failed (file open/locked or permission denied)"))
     list(ok=TRUE, row_index=start_row, sheet=sheet, msg="OK")
   }
   
