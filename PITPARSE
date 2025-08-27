@@ -1,0 +1,1247 @@
+########################################################################################################################
+# app.R — Antenna tag parser (Shiny) + Upload Review + Antenna Log appender (robust to your actual workbook)
+#
+# What’s new in this version (aimed at your real "Antenna Log.xlsx"):
+# - Smarter Excel sheet matching (case-insensitive); reuses existing site tabs if names differ by case.
+# - Flexible column mapping: handles Status vs "Status/Needs", Comments vs "Comment", etc.
+# - Auto-creates any missing columns in the header row (keeps existing order, appends new).
+# - PTAGIS handling:
+#     * If the sheet already has a PTAGIS-like column, show the Y/N control and write into it.
+#     * If user selects PTAGIS=Y but the sheet lacks a PTAGIS column, we now ADD a "PTAGIS" column.
+# - Clearer “where it went” log after append (sheet name and row index).
+# - Keeps prior features (Upload Review, VTT/alarms, copy non-taglist tags, Fish/Sites/Files views, etc.).
+########################################################################################################################
+
+library(shiny)
+library(DT)
+
+# ========= OPTIONAL EXCEL DEP =========
+has_openxlsx <- requireNamespace("openxlsx", quietly = TRUE)
+
+# ========= USER PROFILES =========
+USER_PROFILES <- list(
+  ccunningham = list(
+    download_dir = "C:/Users/ccunningham/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Non_TNWR_Antenna_Files/Download Files",
+    taglist_dir  = "C:/Users/ccunningham/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists",
+    compiled_dir = "C:/Users/ccunningham/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Non_TNWR_Antenna_Files/Compiled Data",
+    vt_path      = "C:/Users/ccunningham/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists/Virtual Test Tags.txt",
+    junk_path    = "C:/Users/ccunningham/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists/Test Tags and Pingers.txt",
+    antenna_log  = "C:/Users/ccunningham/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Antenna Log.xlsx",
+    initials     = "CDC"
+  ),
+  chaskell = list(
+    download_dir = "C:/users/chaskell/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Non_TNWR_Antenna_Files/Download Files",
+    taglist_dir  = "C:/users/chaskell/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists",
+    compiled_dir = "C:/users/chaskell/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Non_TNWR_Antenna_Files/Compiled Data",
+    vt_path      = "C:/users/chaskell/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists/Virtual Test Tags.txt",
+    junk_path    = "C:/users/chaskell/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists/Test Tags and Pingers.txt",
+    antenna_log  = "C:/users/chaskell/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Antenna Log.xlsx",
+    initials     = ""
+  )
+)
+
+# ========= Biomark Alarm Codebook =========
+ALARM_CODEBOOK <- data.frame(
+  code=1:24,
+  message=c(
+    "Reader Date/Time Lost","Reserved for MTS Mode","Reader Memory Error",
+    "Antenna Out Of Tune, Decrease Capacitance","Antenna Out Of Tune, Increase Capacitance",
+    "VTT Test Failed","Antenna Current Low","Noise High","Tuning Capacitance Low","Tuning Capacitance High",
+    "Input Voltage Low","Exciter Voltage Low","Tags Memory Low","Tags Memory Full",
+    "Temperature Low","Temperature High","Sync. Input Not Present","Antenna Current Exceeded 10.0 A",
+    "Antenna Current Exceeded 11.0 A","Reports Memory Low","Reports Memory Full",
+    "Reader Temperature Exceeded 75 C","Reader Forced To Standby","Antenna Not Connected"
+  ),
+  solution=c(
+    "Set the reader’s real-time clock.","",
+    "Internal memory error; unit requires repair.",
+    "Reduce antenna capacitance.","Increase antenna capacitance.",
+    "Verify tuning/noise; adjust VTT level if needed.",
+    "Verify tuning & DC supply; adjust exciter/thresholds as needed.","Verify tuning/environment; adjust threshold as needed.",
+    "Check environment; adjust capacitance/thresholds.","Check environment; adjust capacitance/thresholds.",
+    "Verify DC supply.","Verify DC supply.",
+    "Download memory ASAP.","Download immediately (FIFO).",
+    "Temp < -15°C (approaching -20°C limit).","Temp > +65°C (approaching +70°C limit).",
+    "Slave missing sync; check Master/wiring.","Antenna current >10A; check environment/cable; adjust VE.",
+    "Current >11A at lowest VE; reader in Standby.","Status reports 95% full; download ASAP.",
+    "Status reports full; download immediately.","Temp > +75°C; reader switched to Standby.",
+    "Forced Standby due to fault.","No antenna detected; verify connection."
+  ),
+  stringsAsFactors = FALSE
+)
+
+# ========= HELPERS =========
+`%||%` <- function(a,b) if (!is.null(a)) a else b
+is_nonempty_scalar_string <- function(x) is.character(x) && length(x)==1 && !is.na(x) && nzchar(trimws(x))
+
+is_under_dir <- function(path, dir) {
+  if (!nzchar(path) || !nzchar(dir)) return(FALSE)
+  np <- tryCatch(normalizePath(path, winslash = "/", mustWork = FALSE), error = function(e) path)
+  nd <- tryCatch(normalizePath(dir,  winslash = "/", mustWork = FALSE), error = function(e) dir)
+  startsWith(tolower(np), tolower(nd))
+}
+
+derive_site_from_name <- function(path_or_name) {
+  stem <- tools::file_path_sans_ext(basename(path_or_name))
+  m <- regexpr("^[A-Za-z]+", stem, perl=TRUE)
+  out <- ifelse(m > 0, regmatches(stem, m), "")
+  toupper(out)
+}
+is_master_site <- function(site) site %in% c("LATMC","TAN","KOCH","KCH")
+
+best_time_parse <- function(x) {
+  if (is.null(x)) return(as.POSIXct(character(0), tz="America/Los_Angeles"))
+  x <- trimws(as.character(x)); x <- sub("[Zz]$", "", x)
+  fmts <- c(
+    "%Y-%m-%d %H:%M:%OS","%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M",
+    "%Y/%m/%d %H:%M:%OS","%Y/%m/%d %H:%M:%S","%Y/%m/%d %H:%M",
+    "%m/%d/%Y %H:%M:%OS","%m/%d/%Y %H:%M:%S","%m/%d/%Y %H:%M",
+    "%Y-%m-%dT%H:%M:%OS","%Y-%m-%dT%H:%M:%S","%Y-%m-%dT%H:%M",
+    "%Y-%m-%d","%m/%d/%Y","%Y/%m/%d"
+  )
+  out <- rep(as.POSIXct(NA, tz="America/Los_Angeles"), length(x))
+  for (f in fmts) {
+    idx <- is.na(out); if (!any(idx)) break
+    parsed <- tryCatch(as.POSIXct(x[idx], format=f, tz="America/Los_Angeles"),
+                       error=function(e) rep(as.POSIXct(NA, tz="America/Los_Angeles"), sum(idx)))
+    good <- !is.na(parsed); if (any(good)) out[idx][good] <- parsed[good]
+  }
+  out
+}
+
+safe_read_lines <- function(path) {
+  x <- tryCatch(readLines(path, warn=FALSE, encoding="UTF-8"), error=function(e) character(0))
+  if (!length(x)) return(character(0))
+  x <- iconv(x, from="", to="UTF-8", sub="")
+  x[is.na(x)] <- ""
+  x <- gsub("\\x00", "", x, perl=TRUE)
+  x
+}
+
+derive_date_from_name <- function(fname) {
+  stem <- tools::file_path_sans_ext(basename(fname))
+  m1 <- regmatches(stem, regexpr("\\d{4}-\\d{2}-\\d{2}", stem))
+  if (length(m1) && nzchar(m1)) return(as.Date(m1, format="%Y-%m-%d"))
+  m2 <- regmatches(stem, regexpr("\\d{2}-\\d{2}-\\d{4}", stem))
+  if (length(m2) && nzchar(m2)) return(as.Date(m2, format="%m-%d-%Y"))
+  m3 <- regmatches(stem, regexpr("\\d{2}_\\d{2}_\\d{4}", stem))
+  if (length(m3) && nzchar(m3)) return(as.Date(gsub("_","-", m3), format="%m-%d-%Y"))
+  NA
+}
+
+# ---- Column-agnostic extractors ----
+get_file_vec <- function(df) {
+  n <- nrow(df); if (is.null(n) || !n) return(character(0))
+  out <- rep(NA_character_, n)
+  if ("file" %in% names(df))      { v <- as.character(df$file);      out[is.na(out) | !nzchar(out)] <- v[is.na(out) | !nzchar(out)] }
+  if ("fileName" %in% names(df))  { v <- as.character(df$fileName);  out[is.na(out) | !nzchar(out)] <- v[is.na(out) | !nzchar(out)] }
+  if ("path" %in% names(df))      { v <- basename(as.character(df$path)); out[is.na(out) | !nzchar(out)] <- v[is.na(out) | !nzchar(out)] }
+  out
+}
+get_site_vec <- function(df) {
+  n <- nrow(df); if (is.null(n) || !n) return(character(0))
+  out <- rep(NA_character_, n)
+  if ("site" %in% names(df)) { v <- toupper(gsub("_.*$","", as.character(df$site))); out[is.na(out) | !nzchar(out)] <- v[is.na(out) | !nzchar(out)] }
+  if ("Site" %in% names(df)) { v <- toupper(gsub("_.*$","", as.character(df$Site))); out[is.na(out) | !nzchar(out)] <- v[is.na(out) | !nzchar(out)] }
+  f <- get_file_vec(df); idx <- is.na(out) | !nzchar(out); out[idx] <- toupper(sapply(f[idx], derive_site_from_name))
+  out
+}
+
+ensure_datetime <- function(df) {
+  if (is.null(df) || !nrow(df)) return(df)
+  if (!"dateTime" %in% names(df)) {
+    lowers <- tolower(names(df))
+    alt_ix <- match(c("datetime","date_time","date.time","dettime","time"), lowers)
+    alt_ix <- alt_ix[!is.na(alt_ix)]
+    if (length(alt_ix)) df$dateTime <- df[[ alt_ix[1] ]]
+  }
+  if ("dateTime" %in% names(df) && !inherits(df$dateTime, "POSIXct")) {
+    df$dateTime <- best_time_parse(df$dateTime)
+  }
+  if (!"detYear" %in% names(df) && "dateTime" %in% names(df)) {
+    df$detYear  <- as.numeric(format(df$dateTime, "%Y"))
+    df$detMonth <- as.numeric(format(df$dateTime, "%m"))
+    df$detDay   <- as.numeric(format(df$dateTime, "%j"))
+  }
+  df
+}
+
+# ========= PARSERS =========
+
+# TAG lines
+parse_one_file <- function(file, display_name=NULL) {
+  site <- derive_site_from_name(display_name %||% file)
+  fname <- basename(display_name %||% file)
+  lines_all <- safe_read_lines(file)
+  tag_lines <- lines_all[grepl("^.TAG:", lines_all, perl=TRUE, useBytes=TRUE)]
+  if (!length(tag_lines)) return(data.frame(file=fname, site=site, node=NA, dateTime=NA, tagID=NA, stringsAsFactors=FALSE)[0,])
+  parts <- strsplit(tag_lines, " +", fixed=FALSE)
+  
+  if (is_master_site(site)) {
+    dat <- data.frame(file=fname, site=rep(site,length(parts)), node=NA, dateTime=NA, tagID=NA, stringsAsFactors=FALSE)
+    for (j in seq_along(parts)) {
+      pj <- parts[[j]]
+      if (length(pj) >= 6) { dat$node[j] <- pj[3]; dat$dateTime[j] <- paste(pj[4], pj[5]); dat$tagID[j] <- pj[6] }
+    }
+  } else {
+    dat <- data.frame(file=fname, site=rep(site,length(parts)), node=NA, dateTime=NA, tagID=NA, stringsAsFactors=FALSE)
+    for (j in seq_along(parts)) {
+      pj <- parts[[j]]
+      if (length(pj) >= 5) { dat$dateTime[j] <- paste(pj[3], pj[4]); dat$tagID[j] <- pj[5] }
+    }
+  }
+  dat[!is.na(dat$tagID) & nzchar(dat$tagID), , drop=FALSE]
+}
+
+# SRP helpers
+split_srp_dt_csv <- function(s) {
+  tks <- strsplit(s, "\\s+")[[1]]
+  if (length(tks)>=4 && grepl("^\\d{1,2}/\\d{1,2}/\\d{4}$", tks[2])) return(c(paste(tks[2],tks[3]), tks[4]))
+  if (length(tks)>=5 && grepl("^\\d{1,2}/\\d{1,2}/\\d{4}$", tks[3])) return(c(paste(tks[3],tks[4]), tks[5]))
+  if (length(tks)>=6 && grepl("^\\d{1,2}/\\d{1,2}/\\d{4}$", tks[4])) return(c(paste(tks[4],tks[5]), tks[6]))
+  c(NA, NA)
+}
+
+parse_srp_voltage_df <- function(file, display_name=NULL) {
+  site  <- derive_site_from_name(display_name %||% file)
+  fname <- basename(display_name %||% file)
+  lines_all <- safe_read_lines(file)
+  srp_lines <- lines_all[grepl("^\\*SRP:", lines_all, perl=TRUE, useBytes=TRUE)]
+  if (!length(srp_lines)) return(data.frame(file=fname, site=site, dateTime=as.POSIXct(character(0)), voltage=numeric(0)))
+  parsed <- do.call(rbind, lapply(srp_lines, split_srp_dt_csv))
+  dt   <- best_time_parse(parsed[,1])
+  v    <- vapply(seq_len(nrow(parsed)), function(i) {
+    if (is.na(parsed[i,2])) return(NA_real_)
+    fields <- strsplit(parsed[i,2], ",", fixed=TRUE)[[1]]
+    if (length(fields) >= 10) {
+      vv <- suppressWarnings(as.numeric(fields[10])); if (!is.na(vv)) return(vv/10)
+    }
+    NA_real_
+  }, numeric(1))
+  out <- data.frame(file=fname, site=site, dateTime=dt, voltage=v, stringsAsFactors=FALSE)
+  out <- out[!is.na(out$dateTime) & !is.na(out$voltage), , drop=FALSE]
+  out[order(out$dateTime), , drop=FALSE]
+}
+
+parse_srp_alarms_df <- function(file, display_name=NULL) {
+  site  <- derive_site_from_name(display_name %||% file)
+  fname <- basename(display_name %||% file)
+  lines_all <- safe_read_lines(file)
+  srp_lines <- lines_all[grepl("^\\*SRP:", lines_all, perl=TRUE, useBytes=TRUE)]
+  if (!length(srp_lines)) return(data.frame(file=fname, site=site, dateTime=as.POSIXct(character(0)), A1=integer(0),A2=integer(0),A3=integer(0),A4=integer(0),A5=integer(0)))
+  parsed <- do.call(rbind, lapply(srp_lines, split_srp_dt_csv))
+  dt   <- best_time_parse(parsed[,1])
+  A <- t(vapply(seq_len(nrow(parsed)), function(i){
+    if (is.na(parsed[i,2])) return(c(0L,0L,0L,0L,0L))
+    fields <- strsplit(parsed[i,2], ",", fixed=TRUE)[[1]]
+    if (length(fields) >= 20) {
+      vals <- suppressWarnings(as.integer(fields[16:20])); vals[is.na(vals)] <- 0L; return(vals)
+    }
+    c(0L,0L,0L,0L,0L)
+  }, integer(5)))
+  out <- data.frame(file=fname, site=site, dateTime=dt, A1=A[,1],A2=A[,2],A3=A[,3],A4=A[,4],A5=A[,5], stringsAsFactors=FALSE)
+  out <- out[!is.na(out$dateTime), , drop=FALSE]
+  out
+}
+
+# ========= PTAGIS link builder =========
+ptagis_link_for <- function(tag) {
+  if (!is.character(tag) || !nzchar(tag)) return("")
+  href <- paste0("https://www.ptagis.org/Data/CompleteTagHistory?tagId=", utils::URLencode(tag, reserved = TRUE))
+  sprintf('<a href="%s" target="_blank" rel="noopener"
+           onclick="window.open(this.href, \'_blank\'); return false;">Open in PTAGIS</a>', href)
+}
+
+missing_taglist_meta <- function(df_row) {
+  mcols <- c("Event.Date","Stock","Acoustic.Tag","Release.Site","Event.Site","Release.Site.Name","Event.Site.Name")
+  have <- intersect(mcols, names(df_row))
+  if (!length(have)) return(TRUE)
+  vals <- unlist(lapply(have, function(nm) df_row[[nm]]), use.names = FALSE)
+  all(is.na(vals) | vals == "")
+}
+
+# ========= UI =========
+ui <- fluidPage(
+  tags$head(tags$style(HTML("
+    .kpi { display:inline-block; padding:10px 16px; margin:6px 8px 12px 0; border-radius:10px; background:#f6f6f8; }
+    .kpi .big { font-size:20px; font-weight:700; }
+    .kpi .small { font-size:12px; color:#555; }
+    .section { margin-top:16px; }
+    .note { color:#666; font-size:12px; }
+    .mustload { background:#ffecec; color:#b00000; padding:8px 12px; border-radius:8px; font-weight:600; display:inline-block; margin-bottom:10px; }
+  "))),
+  # Clipboard JS
+  tags$head(tags$script(HTML("
+    Shiny.addCustomMessageHandler('copyToClipboard', function(text) {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function(){
+          Shiny.setInputValue('copy_status', 'ok', {priority:'event'});
+        }).catch(function(err){
+          console.log(err);
+          alert('Copy to clipboard failed.');
+        });
+      } else {
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand('copy'); Shiny.setInputValue('copy_status', 'ok', {priority:'event'}); }
+        catch(e) { alert('Copy to clipboard failed.'); }
+        document.body.removeChild(ta);
+      }
+    });
+  "))),
+  titlePanel("Antenna Compiler & Explorer — Incremental"),
+  sidebarLayout(
+    sidebarPanel(
+      h4("Profile"),
+      selectInput("profile", "User", choices=names(USER_PROFILES), selected="ccunningham", width="100%"),
+      hr(),
+      h4("Taglist & Compiled Datasets"),
+      uiOutput("taglist_picker_ui"),
+      uiOutput("compiled_picker_ui"),
+      hr(),
+      h4("Actions"),
+      actionButton("load_compiled_btn", "Load selected compiled file", class="btn-secondary", width="100%"),
+      br(), br(),
+      actionButton("compile_btn", "Compile now (append ONLY new files)", class="btn-primary", width="100%"),
+      br(), br(),
+      actionButton("upload_btn", "Upload current dataset to 'Compiled Data'", class="btn-success", width="100%"),
+      hr(),
+      h4("Upload new .txt files"),
+      fileInput("local_files", "Choose .txt files", multiple=TRUE, accept=c(".txt"),
+                buttonLabel="Browse…", placeholder="No files selected"),
+      checkboxInput("upload_overwrite", "Overwrite if file exists", FALSE),
+      actionButton("save_uploads_btn", "Save to Download Files", class="btn-info", width="100%"),
+      uiOutput("upload_result_ui"),
+      hr(),
+      h5("Paths"),
+      verbatimTextOutput("paths_display", placeholder=TRUE),
+      width=4
+    ),
+    mainPanel(
+      div(class="kpi",
+          div(class="big", textOutput("kpi_files_scanned", inline=TRUE)), div(class="small","files scanned (Download Files)")),
+      div(class="kpi",
+          div(class="big", textOutput("kpi_files_new", inline=TRUE)), div(class="small","new files appended this run")),
+      div(class="kpi",
+          div(class="big", textOutput("kpi_rows_active", inline=TRUE)), div(class="small","rows in current dataset")),
+      hr(),
+      uiOutput("must_load_banner"),
+      tabsetPanel(id="tabs",
+                  tabPanel("Fish",
+                           div(class="section",
+                               fluidRow(
+                                 column(7, textInput("fish_tag_search", "Search TagID", value="", placeholder="Type a TagID and press Enter")),
+                                 column(3, uiOutput("fish_year_ui")),
+                                 column(2, downloadButton("dl_fish_csv", "CSV"))
+                               ),
+                               div(class="note","Tip: Click any TagID in Sites/Files to jump here with that Tag pre-filled."),
+                               DTOutput("tbl_fish_dets")
+                           )
+                  ),
+                  tabPanel("Sites",
+                           div(class="section",
+                               fluidRow(
+                                 column(4, selectInput("site_pick", "Site", choices=character(0))),
+                                 column(4, uiOutput("site_year_ui")),
+                                 column(4, downloadButton("dl_site_csv", "CSV"))
+                               ),
+                               h5("Unique tags at site"),
+                               div(class="kpi", div(class="big", textOutput("kpi_site_unique", inline=TRUE)), div(class="small","unique tags")),
+                               div(style="margin-bottom:8px;", actionButton("copy_site_missing_btn", "Copy non-taglist tags (CSV)", class="btn-outline-primary")),
+                               DTOutput("tbl_site_unique"),
+                               h5("Detections"),
+                               DTOutput("tbl_site_dets")
+                           )
+                  ),
+                  tabPanel("Files",
+                           div(class="section",
+                               fluidRow(
+                                 column(8, selectizeInput("file_pick", "File(s)", choices=character(0), multiple=TRUE,
+                                                          options=list(placeholder="Pick files to inspect", plugins=list("remove_button")))),
+                                 column(4, downloadButton("dl_files_csv", "CSV"))
+                               ),
+                               h5("Unique tags in selected file(s)"),
+                               div(class="kpi", div(class="big", textOutput("kpi_files_unique", inline=TRUE)), div(class="small","unique tags")),
+                               div(style="margin-bottom:8px;", actionButton("copy_files_missing_btn", "Copy non-taglist tags (CSV)", class="btn-outline-primary")),
+                               DTOutput("tbl_files_unique"),
+                               h5("Detections"),
+                               DTOutput("tbl_files_dets")
+                           )
+                  ),
+                  tabPanel("Log",
+                           div(class="section",
+                               h4("Antenna Log — pending entries"),
+                               uiOutput("log_warn_openxlsx"),
+                               DTOutput("log_queue_tbl"),
+                               tags$hr(),
+                               fluidRow(
+                                 column(3, dateInput("log_date", "Date", value = Sys.Date(), format = "mm/dd/yy")),
+                                 column(2, textInput("log_initials", "Initials", value = "")),
+                                 column(2, selectInput("log_uploaded", "Uploaded", choices=c("Y","N"), selected="Y")),
+                                 column(2, uiOutput("log_ptagis_ui")),
+                                 column(3, textInput("log_status", "Status/Needs", value = "Operational"))
+                               ),
+                               textAreaInput("log_comments", "Comments", value = "", resize="vertical", width="100%"),
+                               fluidRow(
+                                 column(4, actionButton("log_append_btn", "Append to Antenna Log.xlsx", class="btn-primary", width="100%")),
+                                 column(4, actionButton("log_append_all_btn", "Append ALL pending", class="btn-warning", width="100%")),
+                                 column(4, actionButton("log_refresh_btn", "Refresh sheet meta", class="btn-secondary", width="100%"))
+                               ),
+                               tags$br(),
+                               verbatimTextOutput("log_result")
+                           )
+                  )
+      ),
+      br(),
+      tags$details(tags$summary("Debug / Info"), verbatimTextOutput("debug_info"))
+    )
+  )
+)
+
+# ========= SERVER =========
+server <- function(input, output, session) {
+  # ---------- Excel helpers tuned to your actual workbook ----------
+  norm_name <- function(x) {
+    tolower(gsub("[^a-z0-9]+","", trimws(as.character(x))))
+  }
+  # Column aliases we accept (left side = normalized canonical; right = accepted aliases)
+  COL_ALIASES <- list(
+    date         = c("date"),
+    initials     = c("initials","whouploaded","uploadedby"),
+    uploaded     = c("uploaded","upload"),
+    ptagis       = c("ptagis","uploadedptagis","uploadedtoptagis","ptagisy_n","ptagisy/n","ptagisuploaded"),
+    statusneeds  = c("statusneeds","status","status/needs","status_needs"),
+    comments     = c("comments","comment","notes")
+  )
+  # Return a mapping from canonical -> actual column name present (or NA if missing)
+  map_cols <- function(headers) {
+    hnorm <- norm_name(headers)
+    out <- setNames(rep(NA_character_, length(COL_ALIASES)), names(COL_ALIASES))
+    for (can in names(COL_ALIASES)) {
+      aliases <- unique(c(can, COL_ALIASES[[can]]))
+      ix <- match(aliases, hnorm)
+      ix <- ix[!is.na(ix)]
+      if (length(ix)) out[[can]] <- headers[ix[1]]
+    }
+    out
+  }
+  # Ensure header contains all required columns (append missing at end, keep existing order)
+  ensure_header <- function(wb, sheet, headers_now, need_ptagis) {
+    need <- c("Date","Initials","Uploaded","Status/Needs","Comments")
+    if (isTRUE(need_ptagis) && !"PTAGIS" %in% headers_now) need <- append(need, "PTAGIS", after=3)
+    missing <- setdiff(need, headers_now)
+    if (!length(missing)) return(headers_now)
+    new_headers <- c(headers_now, missing)
+    openxlsx::writeData(wb, sheet = sheet, x = as.data.frame(setNames(as.list(rep(NA, length(new_headers))), new_headers)),
+                        startCol = 1, startRow = 1, withFilter = FALSE)
+    new_headers
+  }
+  # Safe open / sheet pick (case-insensitive match to reuse existing site tab)
+  open_wb_and_pick_sheet <- function(path, site_code) {
+    wb <- if (file.exists(path)) try(openxlsx::loadWorkbook(path), silent=TRUE) else openxlsx::createWorkbook()
+    if (inherits(wb, "try-error")) return(list(error="Could not open workbook", wb=NULL, sheet=NULL))
+    sheets_now <- openxlsx::sheets(wb)
+    sheet <- site_code
+    if (length(sheets_now)) {
+      # case-insensitive exact match first
+      ci_match <- which(tolower(sheets_now) == tolower(site_code))
+      if (length(ci_match)) sheet <- sheets_now[ci_match[1]]
+    }
+    if (!(sheet %in% openxlsx::sheets(wb))) openxlsx::addWorksheet(wb, sheet)
+    list(error=NULL, wb=wb, sheet=sheet)
+  }
+  # Write one row given form values; returns list(ok, row_index, sheet, msg)
+  append_one_row <- function(path, site_code, Date, Initials, Uploaded, PTagis, Status, Comments, force_add_ptagis=FALSE) {
+    pick <- open_wb_and_pick_sheet(path, site_code)
+    if (!is.null(pick$error)) return(list(ok=FALSE, row_index=NA_integer_, sheet=site_code, msg=pick$error))
+    wb <- pick$wb; sheet <- pick$sheet
+    df0 <- try(openxlsx::readWorkbook(wb, sheet = sheet), silent=TRUE)
+    if (inherits(df0, "try-error") || !is.data.frame(df0)) df0 <- data.frame()
+    headers_now <- if (ncol(df0)) names(df0) else character(0)
+    
+    # Map existing columns
+    cmap <- map_cols(headers_now)
+    # Decide if PTAGIS should be present (existing or requested)
+    need_ptagis <- (!is.na(cmap["ptagis"])) || isTRUE(force_add_ptagis) || (isTRUE(!is.na(PTagis)) && nzchar(PTagis))
+    # Ensure header has all needed columns (may write header row)
+    headers_now <- ensure_header(wb, sheet, headers_now, need_ptagis)
+    # Re-read after header normalization
+    df0 <- try(openxlsx::readWorkbook(wb, sheet = sheet), silent=TRUE)
+    if (inherits(df0, "try-error") || !is.data.frame(df0)) df0 <- data.frame()
+    if (!ncol(df0)) {
+      # just header row existed
+      df0 <- as.data.frame(setNames(as.list(rep(NA, length(headers_now))), headers_now))
+      df0 <- df0[0, , drop=FALSE]
+    }
+    
+    # Build an aligned named list for the new row
+    new_row <- as.list(rep(NA, length(headers_now))); names(new_row) <- headers_now
+    set_if <- function(cand_names, val) {
+      nm <- intersect(cand_names, names(new_row))
+      if (length(nm)) new_row[[ nm[1] ]] <<- val
+    }
+    set_if(c("Date"), as.character(Date))
+    set_if(c("Initials"), Initials)
+    set_if(c("Uploaded"), Uploaded)
+    if (need_ptagis) set_if(c("PTAGIS"), PTagis %||% "N")
+    set_if(c("Status/Needs","Status"), Status)
+    set_if(c("Comments","Comment","Notes"), Comments)
+    
+    append_df <- as.data.frame(new_row, stringsAsFactors = FALSE)
+    start_row <- nrow(df0) + 2  # row 1 header, so first data row = 2
+    openxlsx::writeData(wb, sheet = sheet, x = append_df, startRow = start_row, colNames = FALSE, withFilter = FALSE)
+    
+    ok <- try(openxlsx::saveWorkbook(wb, file = path, overwrite = TRUE), silent=TRUE)
+    if (inherits(ok, "try-error")) return(list(ok=FALSE, row_index=NA_integer_, sheet=sheet, msg="Save failed (file open/locked or permission denied)"))
+    list(ok=TRUE, row_index=start_row, sheet=sheet, msg="OK")
+  }
+  
+  # ---------- Active dataset presence flag ----------
+  output$must_load_banner <- renderUI({
+    df <- active_df()
+    if (is.null(df) || !nrow(df)) div(class="mustload", "Must load compiled file.")
+  })
+  
+  # ----- Paths by profile
+  paths <- reactive({ USER_PROFILES[[ input$profile ]] %||% NULL })
+  
+  # Pre-fill initials when profile changes
+  observeEvent(input$profile, {
+    p <- USER_PROFILES[[ input$profile ]]
+    updateTextInput(session, "log_initials", value = p$initials %||% "")
+  }, ignoreInit = TRUE)
+  
+  # ----- Blocklists
+  load_blocklists <- function(vt_path, junk_path) {
+    vt.tags <- tryCatch({ x <- readLines(vt_path, warn=FALSE); if (length(x)>=3) x[3:length(x)] else character(0)}, error=function(e) character(0))
+    junk.tags <- tryCatch({ x <- readLines(junk_path, warn=FALSE); if (length(x)>=3) x[3:length(x)] else character(0)}, error=function(e) character(0))
+    unique(c(vt.tags, junk.tags))
+  }
+  load_vt_only <- function(vt_path) {
+    tryCatch({ x <- readLines(vt_path, warn=FALSE); if (length(x)>=3) x[3:length(x)] else character(0) }, error=function(e) character(0))
+  }
+  bl_vec <- reactive({ p <- paths(); if (is.null(p)) character(0) else load_blocklists(p$vt_path, p$junk_path) })
+  
+  # ----- Taglists / compiled pickers (UI)
+  list_taglists <- reactive({
+    p <- paths(); if (is.null(p)) return(data.frame())
+    if (!dir.exists(p$taglist_dir)) return(data.frame())
+    files <- list.files(p$taglist_dir, pattern="^allBT&CT_tags_\\d{4}-\\d{2}\\.csv$", full.names=TRUE)
+    if (!length(files)) return(data.frame())
+    nm <- basename(files); stamp <- sub("^allBT&CT_tags_(\\d{4}-\\d{2})\\.csv$","\\1", nm)
+    df <- data.frame(path=files, stamp=stamp, stringsAsFactors=FALSE)
+    df[order(df$stamp, decreasing=TRUE), ]
+  })
+  list_compiled <- reactive({
+    p <- paths(); if (is.null(p)) return(data.frame())
+    if (!dir.exists(p$compiled_dir)) return(data.frame())
+    files <- list.files(p$compiled_dir, pattern="^allDets_with_BT&CT_tags_\\d{4}-\\d{2}-\\d{2}\\.rds$", full.names=TRUE)
+    if (!length(files)) return(data.frame())
+    nm <- basename(files); stamp <- sub("^allDets_with_BT&CT_tags_(\\d{4}-\\d{2}-\\d{2})\\.rds$","\\1", nm)
+    df <- data.frame(path=files, date=stamp, stringsAsFactors=FALSE)
+    df[order(df$date, decreasing=TRUE), ]
+  })
+  output$taglist_picker_ui <- renderUI({
+    df <- list_taglists()
+    if (!nrow(df)) return(helpText("No taglists found (expects allBT&CT_tags_YYYY-MM.csv)."))
+    choices <- stats::setNames(df$path, paste0(df$stamp, "  —  ", basename(df$path)))
+    selectInput("taglist_pick", "Taglist CSV", choices=choices, selected=df$path[1], width="100%")
+  })
+  output$compiled_picker_ui <- renderUI({
+    df <- list_compiled()
+    if (!nrow(df)) return(helpText("No compiled files found (expects allDets_with_BT&CT_tags_YYYY-MM-DD.rds)."))
+    choices <- stats::setNames(df$path, paste0(df$date, "  —  ", basename(df$path)))
+    selectInput("compiled_pick", "Compiled RDS", choices=choices, selected=df$path[1], width="100%")
+  })
+  newest_compiled_path <- reactive({ df <- list_compiled(); if (!nrow(df)) "" else df$path[1] })
+  
+  # ----- Core state
+  active_df     <- reactiveVal(NULL)
+  scanned_files <- reactiveVal(character(0))
+  new_files_ct  <- reactiveVal(0)
+  
+  # ----- Year pickers
+  years_choices <- reactive({
+    df <- active_df()
+    if (is.null(df)) return(c("All Years"))
+    df <- ensure_datetime(df)
+    ys <- sort(unique(df$detYear), decreasing=TRUE)
+    c("All Years", as.character(ys))
+  })
+  output$fish_year_ui <- renderUI({ selectInput("fish_year_sel", "Year", choices=years_choices(), selected="All Years", width="100%") })
+  output$site_year_ui <- renderUI({ selectInput("site_year_sel", "Year", choices=years_choices(), selected="All Years", width="100%") })
+  
+  # ----- Load compiled
+  observeEvent(input$load_compiled_btn, {
+    pick <- input$compiled_pick %||% ""
+    p <- paths()
+    if (!(nzchar(pick) && file.exists(pick) && is_under_dir(pick, p$compiled_dir))) { showNotification("Pick a compiled file (current profile).", type="warning"); return() }
+    dat <- tryCatch(readRDS(pick), error=function(e) NULL)
+    if (is.null(dat) || !nrow(dat)) { showNotification("Could not read that compiled file.", type="error"); return() }
+    dat <- ensure_datetime(dat)
+    active_df(dat); scanned_files(character(0)); new_files_ct(0)
+    showNotification(paste0("Loaded ", basename(pick), " (", format(nrow(dat), big.mark=","), " rows)."), type="message")
+  })
+  
+  # ----- Compile (append-only, recursive)
+  observeEvent(input$compile_btn, {
+    p <- paths(); shiny::validate(shiny::need(!is.null(p), "Invalid profile"))
+    base <- p$download_dir; shiny::validate(shiny::need(dir.exists(base), "Download directory not found"))
+    if (is.null(active_df())) {
+      auto <- newest_compiled_path()
+      if (nzchar(auto) && file.exists(auto)) {
+        dat0 <- tryCatch(readRDS(auto), error=function(e) NULL)
+        if (!is.null(dat0) && nrow(dat0)) { dat0 <- ensure_datetime(dat0); active_df(dat0)
+        showNotification(paste0("Auto-loaded base: ", basename(auto), " (", format(nrow(dat0), big.mark=","), " rows)."), type="message") }
+      }
+    }
+    files_all <- list.files(base, pattern="\\.txt$", full.names=TRUE, recursive=TRUE, ignore.case=TRUE)
+    shiny::validate(shiny::need(length(files_all)>0, "No .txt files found to compile"))
+    scanned_files(files_all)
+    
+    cur <- active_df()
+    already <- character(0)
+    if (!is.null(cur)) {
+      fv <- get_file_vec(cur)
+      already <- unique(fv[!is.na(fv) & nzchar(fv)])
+    }
+    files_new <- setdiff(basename(files_all), basename(already))
+    if (!length(files_new)) { new_files_ct(0); showNotification("No new files found. Dataset unchanged.", type="message"); return() }
+    
+    withProgress(message=paste0("Parsing ", length(files_new), " new file(s)…"), value=0, {
+      parts <- vector("list", length(files_new))
+      for (i in seq_along(files_new)) {
+        fpath <- files_all[basename(files_all) == files_new[i]][1]
+        parts[[i]] <- parse_one_file(fpath)
+        incProgress(i/length(files_new), detail = files_new[i])
+      }
+      dat_new <- do.call(rbind, parts)
+    })
+    
+    bl <- bl_vec()
+    if (length(bl)) dat_new <- dat_new[!(dat_new$tagID %in% bl), , drop=FALSE]
+    
+    dat_new$dateTime <- best_time_parse(dat_new$dateTime)
+    ord <- order(dat_new$site, dat_new$file, dat_new$dateTime, dat_new$tagID)
+    dat_new <- dat_new[ord, ]
+    dup_key <- paste(dat_new$site, dat_new$dateTime, dat_new$tagID)
+    dat_new <- dat_new[!duplicated(dup_key), , drop=FALSE]
+    
+    dat_new$Type     <- "Biomark"
+    dat_new$duration <- NA; dat_new$class <- NA; dat_new$ukn <- NA; dat_new$elapsed <- NA; dat_new$strL <- NA
+    dat_new$detYear  <- as.numeric(format(dat_new$dateTime, "%Y"))
+    dat_new$detMonth <- as.numeric(format(dat_new$dateTime, "%m"))
+    dat_new$detDay   <- as.numeric(format(dat_new$dateTime, "%j"))
+    dat_new <- dat_new[,c("Type","dateTime","tagID","duration","class","site","node","file","ukn","elapsed","strL","detYear","detMonth","detDay")]
+    
+    dat_merge <- dat_new
+    
+    # Taglist merge
+    tlp <- input$taglist_pick %||% ""
+    if (nzchar(tlp) && file.exists(tlp) && is_under_dir(tlp, paths()$taglist_dir)) {
+      bt <- tryCatch(read.csv(tlp, stringsAsFactors=FALSE), error=function(e) NULL)
+      if (!is.null(bt) && nrow(bt)) {
+        keep_cols <- c('PIT.Tag','Stock','Event.Type','Organization','Event.Date','Brood.Year','Session',
+                       'Acoustic.Tag','Length.FL','Length.TL','Other.Tag',
+                       'Release.Site','Event.Site','Release.Site.Name','Event.Site.Name')
+        keep_cols <- keep_cols[keep_cols %in% names(bt)]
+        bt_sub <- bt[bt$Event.Type %in% c('MARK','Mark','mark'), keep_cols, drop=FALSE]
+        dat_merge <- merge(dat_merge, bt_sub, by.x="tagID", by.y="PIT.Tag", all.x=TRUE)
+      }
+    }
+    
+    cur <- active_df()
+    if (is.null(cur)) {
+      cur <- dat_merge
+    } else {
+      common <- union(names(cur), names(dat_merge))
+      for (nm in setdiff(common, names(cur)))       cur[[nm]] <- NA
+      for (nm in setdiff(common, names(dat_merge))) dat_merge[[nm]] <- NA
+      cur <- rbind(cur[,common], dat_merge[,common])
+      tag_col <- if ("tagID" %in% names(cur)) "tagID" else if ("TagID" %in% names(cur)) "TagID" else if ("PIT.Tag" %in% names(cur)) "PIT.Tag" else NULL
+      k <- paste(get_site_vec(cur), ensure_datetime(cur)$dateTime,
+                 if (!is.null(tag_col)) as.character(cur[[tag_col]]) else "")
+      cur <- cur[!duplicated(k), , drop=FALSE]
+    }
+    
+    active_df(cur <- ensure_datetime(cur))
+    new_files_ct(length(files_new))
+    showNotification(paste0("Appended ", length(files_new), " new file(s). Active rows: ", format(nrow(cur), big.mark=","), "."), type="message")
+  })
+  
+  # ========= Upload Review (pre-commit modal) =========
+  build_upload_review <- function(src_paths, display_names, vt_vec, taglist_path=NULL, blocklist=character(0)) {
+    tag_meta <- NULL
+    if (is_nonempty_scalar_string(taglist_path) && file.exists(taglist_path)) {
+      tag_meta <- tryCatch(read.csv(taglist_path, stringsAsFactors=FALSE), error=function(e) NULL)
+      if (!is.null(tag_meta) && nrow(tag_meta)) tag_meta <- tag_meta[tag_meta$Event.Type %in% c('MARK','Mark','mark'), , drop=FALSE]
+    }
+    
+    out <- lapply(seq_along(src_paths), function(i){
+      vdf <- parse_srp_voltage_df(src_paths[i], display_name = display_names[i])
+      dets <- parse_one_file(src_paths[i], display_name = display_names[i])
+      dets <- ensure_datetime(dets)
+      vt_only <- dets[!is.na(dets$tagID) & dets$tagID %in% vt_vec & !is.na(dets$dateTime), , drop=FALSE]
+      vtt_counts <- if (nrow(vt_only)) {
+        agg <- aggregate(list(n_VTT = rep(1L, nrow(vt_only))), by = list(Date = as.Date(vt_only$dateTime)), FUN = sum)
+        agg[order(agg$Date), , drop=FALSE]
+      } else data.frame(Date=as.Date(character(0)), n_VTT=integer(0))
+      
+      uniq_ids <- unique(dets$tagID[!is.na(dets$tagID)])
+      if (length(blocklist)) uniq_ids <- setdiff(uniq_ids, blocklist)
+      uniq_tbl <- if (length(uniq_ids)) data.frame(TagID = uniq_ids, stringsAsFactors = FALSE) else data.frame(TagID=character(0))
+      
+      if (!is.null(tag_meta) && nrow(uniq_tbl)) {
+        keep_cols <- c('PIT.Tag','Event.Date','Stock','Acoustic.Tag','Release.Site','Event.Site','Release.Site.Name','Event.Site.Name')
+        keep_cols <- keep_cols[keep_cols %in% names(tag_meta)]
+        bt_sub <- unique(tag_meta[, keep_cols, drop=FALSE]); names(bt_sub)[names(bt_sub)=="PIT.Tag"] <- "TagID"
+        uniq_tbl <- merge(uniq_tbl, bt_sub, by="TagID", all.x=TRUE)
+      }
+      
+      if (nrow(uniq_tbl)) {
+        uniq_tbl$PTAGIS <- vapply(seq_len(nrow(uniq_tbl)), function(r){
+          if (missing_taglist_meta(uniq_tbl[r, , drop=FALSE])) ptagis_link_for(uniq_tbl$TagID[r]) else ""
+        }, character(1))
+      }
+      
+      uniq_tbl <- uniq_tbl[order(uniq_tbl$TagID), , drop=FALSE]
+      uniq_count <- nrow(uniq_tbl)
+      
+      adf <- parse_srp_alarms_df(src_paths[i], display_name = display_names[i])
+      alarms_any <- if (nrow(adf)) adf[rowSums(cbind(adf$A1,adf$A2,adf$A3,adf$A4,adf$A5)!=0, na.rm=TRUE)>0, ] else adf
+      alarms_list <- if (nrow(alarms_any)) {
+        rows <- lapply(seq_len(nrow(alarms_any)), function(r){
+          codes <- as.integer(c(alarms_any$A1[r], alarms_any$A2[r], alarms_any$A3[r], alarms_any$A4[r], alarms_any$A5[r]))
+          codes <- codes[!is.na(codes) & codes != 0]
+          if (!length(codes)) return(NULL)
+          cb <- ALARM_CODEBOOK[match(codes, ALARM_CODEBOOK$code), ]
+          msg <- ifelse(is.na(cb$message), paste0("Unknown code ", codes), cb$message)
+          sol <- ifelse(is.na(cb$solution), "", cb$solution)
+          data.frame(dateTime=alarms_any$dateTime[r], Codes=paste(codes, collapse="; "),
+                     Messages=paste(msg, collapse=" | "), Solutions=paste(sol[sol!=""], collapse=" | "),
+                     stringsAsFactors=FALSE)
+        })
+        df <- do.call(rbind, rows); if (is.null(df)) data.frame(dateTime=as.POSIXct(character(0)), Codes=character(0), Messages=character(0), Solutions=character(0))
+        else df[order(df$dateTime), , drop=FALSE]
+      } else data.frame(dateTime=as.POSIXct(character(0)), Codes=character(0), Messages=character(0), Solutions=character(0))
+      
+      list(voltage=vdf, vtt=vtt_counts, unique_tbl=uniq_tbl, unique_count=uniq_count, alarms_list=alarms_list)
+    })
+    if (length(out)==length(display_names)) names(out) <- display_names else names(out) <- paste0("file_", seq_along(out))
+    out
+  }
+  
+  rv <- reactiveValues(
+    review_data=NULL, review_src=NULL, review_names=NULL, review_target=NULL, review_overwrite=FALSE,
+    log_queue=NULL, log_sheet_has_ptagis=FALSE
+  )
+  
+  # Save to Download Files => open Upload Review modal (pre-commit)
+  observeEvent(input$save_uploads_btn, {
+    p <- paths(); shiny::validate(shiny::need(!is.null(p), "Invalid profile"))
+    upl <- input$local_files
+    if (is.null(upl) || !nrow(upl)) { showNotification("Pick one or more .txt files first.", type="warning"); return() }
+    
+    target_dir <- p$download_dir
+    if (!is_nonempty_scalar_string(target_dir) || !dir.exists(target_dir)) {
+      target_dir <- path.expand("~/DownloadedFiles")
+      if (!dir.exists(target_dir)) {
+        ok_mkdir <- tryCatch({ dir.create(target_dir, recursive=TRUE); TRUE }, error=function(e) FALSE)
+        if (!ok_mkdir) { showNotification(sprintf("Could not create folder: %s", target_dir), type="error"); return() }
+      }
+    }
+    
+    vt_vec   <- load_vt_only(p$vt_path)
+    bl_all   <- bl_vec()
+    src_paths     <- upl$datapath
+    display_names <- basename(upl$name)
+    
+    taglist_path <- input$taglist_pick %||% ""
+    if (!(nzchar(taglist_path) && file.exists(taglist_path) && is_under_dir(taglist_path, p$taglist_dir))) taglist_path <- ""
+    
+    rv$review_data      <- build_upload_review(src_paths, display_names, vt_vec, taglist_path, blocklist=bl_all)
+    rv$review_src       <- src_paths
+    rv$review_names     <- display_names
+    rv$review_target    <- target_dir
+    rv$review_overwrite <- isTRUE(input$upload_overwrite)
+    
+    showModal(modalDialog(
+      title = sprintf("Upload Review (%d file%s — not yet saved)", length(display_names), ifelse(length(display_names)==1,"","s")),
+      size = "l", easyClose = FALSE,
+      footer = tagList(modalButton("Cancel"), actionButton("review_proceed", "Proceed & Save", class="btn-primary")),
+      uiOutput("review_ui")
+    ))
+  })
+  
+  output$review_ui <- renderUI({
+    dat <- rv$review_data
+    if (is.null(dat) || !length(dat)) return(tags$em("No data to review."))
+    files <- names(dat)
+    tagList(
+      selectInput("review_file", "Select file", choices=files, selected=if (length(files)) files[[1]] else NULL, width="100%"),
+      tags$br(),
+      h5("Voltage (V) from *SRP:* (10th CSV ÷ 10)"),
+      plotOutput("review_voltage_plot", height="260px"),
+      tags$br(),
+      h5("VTT detections per day"),
+      DTOutput("review_vtt_tbl"),
+      tags$br(),
+      h5("Unique tags detected"),
+      div(class="kpi",
+          div(class="big", textOutput("review_unique_kpi", inline=TRUE)),
+          div(class="small","unique tags")),
+      div(style="margin-bottom:8px;",
+          actionButton("review_copy_missing", "Copy non-taglist tags (CSV)", class="btn-outline-primary")
+      ),
+      DTOutput("review_unique_tbl"),
+      tags$br(),
+      h5("Alarm events (non-zero)"),
+      DTOutput("review_alarms_tbl")
+    )
+  })
+  
+  cur_review <- reactive({ f <- input$review_file %||% (names(rv$review_data)[1] %||% ""); rv$review_data[[f]] })
+  output$review_voltage_plot <- renderPlot({
+    x <- cur_review()
+    if (is.null(x) || is.null(x$voltage) || !nrow(x$voltage)) { plot.new(); text(0.5,0.5,"No SRP voltage found"); return(invisible()) }
+    plot(x$voltage$dateTime, x$voltage$voltage, type="l", xlab="Time", ylab="Voltage (V)"); grid()
+  })
+  output$review_vtt_tbl <- renderDT({
+    x <- cur_review(); df <- x$vtt
+    if (is.null(df) || !nrow(df)) df <- data.frame(message="No VTT detections", stringsAsFactors=FALSE)
+    datatable(df, options=list(pageLength=8, dom='t', order=list(list(0,'asc'))), rownames=FALSE)
+  })
+  output$review_unique_kpi <- renderText({ x <- cur_review(); x$unique_count %||% 0L })
+  output$review_unique_tbl <- renderDT({
+    x <- cur_review(); df <- x$unique_tbl
+    if (is.null(df) || !nrow(df)) df <- data.frame(message="No tag detections", stringsAsFactors=FALSE)
+    datatable(df, options=list(pageLength=10, scrollX=TRUE), rownames=FALSE, escape=FALSE)
+  })
+  output$review_alarms_tbl <- renderDT({
+    x <- cur_review(); df <- x$alarms_list
+    if (is.null(df) || !nrow(df)) df <- data.frame(message="No non-zero alarms", stringsAsFactors=FALSE)
+    datatable(df, options=list(pageLength=10, scrollX=TRUE), rownames=FALSE)
+  })
+  
+  # ===== COPY HELPERS =====
+  unique_missing_tags <- function(df, blocklist=character(0)) {
+    if (is.null(df) || !nrow(df)) return(character(0))
+    tag_col <- if ("tagID" %in% names(df)) "tagID" else if ("TagID" %in% names(df)) "TagID" else if ("PIT.Tag" %in% names(df)) "PIT.Tag" else NULL
+    if (is.null(tag_col)) return(character(0))
+    tags <- as.character(df[[tag_col]])
+    if (length(blocklist)) {
+      keep <- !is.na(tags) & !(tags %in% blocklist)
+      df <- df[keep, , drop=FALSE]; tags <- tags[keep]
+    }
+    if (!nrow(df)) return(character(0))
+    df <- ensure_datetime(df)
+    pref <- if ("Event.Date" %in% names(df)) !is.na(df$Event.Date) else rep(FALSE, nrow(df))
+    ord <- order(pref, df$dateTime, decreasing=TRUE)
+    df2 <- df[ord, , drop=FALSE]
+    dedup_idx <- !duplicated(as.character(df2[[tag_col]]))
+    df2 <- df2[dedup_idx, , drop=FALSE]
+    keep_missing <- vapply(seq_len(nrow(df2)), function(i) missing_taglist_meta(df2[i, , drop=FALSE]), logical(1))
+    as.character(df2[[tag_col]][keep_missing])
+  }
+  observeEvent(input$copy_site_missing_btn, {
+    df <- site_filtered()
+    tags <- unique_missing_tags(df, bl_vec())
+    if (!length(tags)) { showNotification("No non-taglist tags found for this site selection.", type="warning"); return() }
+    session$sendCustomMessage("copyToClipboard", paste(tags, collapse = ","))
+    showNotification(sprintf("Copied %d tag(s) to clipboard.", length(tags)), type="message")
+  })
+  observeEvent(input$copy_files_missing_btn, {
+    df <- files_filtered()
+    tags <- unique_missing_tags(df, bl_vec())
+    if (!length(tags)) { showNotification("No non-taglist tags found for selected file(s).", type="warning"); return() }
+    session$sendCustomMessage("copyToClipboard", paste(tags, collapse = ","))
+    showNotification(sprintf("Copied %d tag(s) to clipboard.", length(tags)), type="message")
+  })
+  observeEvent(input$review_copy_missing, {
+    x <- cur_review()
+    ut <- x$unique_tbl
+    if (is.null(ut) || !nrow(ut) || !("TagID" %in% names(ut))) {
+      showNotification("No tags to copy for this file.", type="warning"); return()
+    }
+    keep <- vapply(seq_len(nrow(ut)), function(i) missing_taglist_meta(ut[i, , drop=FALSE]), logical(1))
+    tags <- ut$TagID[keep]
+    if (!length(tags)) { showNotification("No non-taglist tags found for this file.", type="warning"); return() }
+    session$sendCustomMessage("copyToClipboard", paste(tags, collapse = ","))
+    showNotification(sprintf("Copied %d tag(s) to clipboard.", length(tags)), type="message")
+  })
+  
+  # =============== After review: copy files, then build LOG QUEUE and jump to Log tab ===============
+  rv$log_queue <- NULL
+  observeEvent(input$review_proceed, {
+    req(rv$review_src, rv$review_names, rv$review_target)
+    overwrite <- isTRUE(rv$review_overwrite)
+    srcs  <- rv$review_src; names_in <- rv$review_names; target_dir <- rv$review_target
+    success <- logical(length(srcs)); msgs <- character(length(srcs))
+    for (i in seq_along(srcs)) {
+      dest <- file.path(target_dir, names_in[i]); ok <- FALSE; msg <- "OK"
+      if (!grepl("\\.txt$", names_in[i], ignore.case=TRUE)) { msg <- "Skipped (not .txt)"; ok <- FALSE }
+      else { ok <- tryCatch(file.copy(srcs[i], dest, overwrite=overwrite), error=function(e) FALSE); if (!ok) msg <- "Failed to copy" }
+      success[i] <- ok; msgs[i] <- sprintf("%s -> %s : %s", names_in[i], dest, msg)
+    }
+    removeModal()
+    n_ok <- sum(success); n_no <- length(success) - n_ok
+    if (n_ok > 0) showNotification(sprintf("Saved %d file(s) to: %s", n_ok, target_dir), type="message", duration=6)
+    if (n_no > 0) showNotification(sprintf("Skipped/failed: %d file(s). See details below.", n_no), type="warning", duration=8)
+    output$upload_result_ui <- renderUI({ tags$details(tags$summary("Upload details"), tags$pre(paste(msgs, collapse="\n"))) })
+    
+    if (n_ok > 0) {
+      alarm_flag <- vapply(seq_along(names_in), function(i) {
+        item <- rv$review_data[[ names_in[i] ]]
+        any(!is.null(item) && !is.null(item$alarms_list) && nrow(item$alarms_list) > 0)
+      }, logical(1))
+      rv$log_queue <- data.frame(
+        File   = names_in,
+        Site   = toupper(sapply(names_in, derive_site_from_name)),
+        Date   = as.Date(ifelse(is.na(derive_date_from_name(names_in)), Sys.Date(), derive_date_from_name(names_in)), origin="1970-01-01"),
+        Status = ifelse(alarm_flag, "Alarm", "Operational"),
+        stringsAsFactors = FALSE
+      )
+      p <- paths()
+      updateTextInput(session, "log_initials", value = (p$initials %||% ""))
+      updateSelectInput(session, "log_uploaded", selected="Y")
+      updateTextInput(session, "log_status", value = "Operational")
+      updateTextAreaInput(session, "log_comments", value = "")
+      updateTabsetPanel(session, "tabs", selected="Log")
+    }
+  })
+  
+  # ========= Populate selectors when active changes =========
+  observeEvent(active_df(), {
+    mer <- active_df(); if (is.null(mer) || !nrow(mer)) return(NULL)
+    mer <- ensure_datetime(mer)
+    base_sites <- sort(unique(na.omit(get_site_vec(mer))))
+    if (!length(base_sites)) base_sites <- character(0)
+    updateSelectInput(session, "site_pick", choices=base_sites, selected=if (length(base_sites)) base_sites[1] else NULL)
+    
+    files <- sort(unique(na.omit(get_file_vec(mer))))
+    updateSelectizeInput(session, "file_pick", choices=files, server=TRUE)
+  })
+  
+  # ========= FISH / SITES / FILES =========
+  fish_filtered <- reactive({
+    mer <- active_df(); if (is.null(mer)) return(data.frame())
+    mer <- ensure_datetime(mer)
+    tag_col <- if ("tagID" %in% names(mer)) "tagID" else if ("TagID" %in% names(mer)) "TagID" else if ("PIT.Tag" %in% names(mer)) "PIT.Tag" else NULL
+    if (is.null(tag_col)) return(mer[0,,drop=FALSE])
+    q <- trimws(input$fish_tag_search %||% ""); if (!nzchar(q)) return(mer[0,,drop=FALSE])
+    df <- mer[as.character(mer[[tag_col]]) == q, , drop=FALSE]
+    yr_sel <- input$fish_year_sel %||% "All Years"
+    if (nzchar(yr_sel) && yr_sel != "All Years") df <- df[df$detYear == as.integer(yr_sel), , drop=FALSE]
+    if (!"site" %in% names(df)) df$site <- get_site_vec(df)
+    if (!"file" %in% names(df)) df$file <- get_file_vec(df)
+    if (!"tagID" %in% names(df)) df$tagID <- as.character(df[[tag_col]])
+    df$PTAGIS <- ""
+    if (nrow(df)) {
+      need <- missing_taglist_meta(df[1, , drop=FALSE])
+      if (need) df$PTAGIS <- ptagis_link_for(df$tagID[1])
+    }
+    df[order(df$site, df$file, df$dateTime), ]
+  })
+  output$tbl_fish_dets <- renderDT({
+    if (is.null(active_df()) || !nrow(active_df())) return(datatable(data.frame(), rownames=FALSE))
+    df <- fish_filtered()
+    cols <- intersect(c("dateTime","tagID","site","node","file","Stock","Event.Type","Organization","Event.Date",
+                        "Brood.Year","Session","Acoustic.Tag","Length.FL","Length.TL","Release.Site","Event.Site",
+                        "Release.Site.Name","Event.Site.Name","PTAGIS"), names(df))
+    if (!length(cols)) return(datatable(data.frame(), rownames=FALSE))
+    datatable(df[, cols, drop=FALSE], options=list(pageLength=25, scrollX=TRUE), rownames=FALSE, escape=FALSE)
+  })
+  output$dl_fish_csv <- downloadHandler(
+    filename=function(){ q <- trimws(input$fish_tag_search %||% "tag"); paste0("fish_", q, "_detections_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv") },
+    content=function(file) write.csv(fish_filtered(), file, row.names=FALSE)
+  )
+  
+  site_filtered <- reactive({
+    mer <- active_df(); if (is.null(mer)) return(data.frame())
+    mer <- ensure_datetime(mer)
+    site_vec <- get_site_vec(mer)
+    st <- input$site_pick
+    if (!is_nonempty_scalar_string(st)) return(mer[0,,drop=FALSE])
+    df <- mer[!is.na(site_vec) & site_vec == toupper(st), , drop=FALSE]
+    yr_sel <- input$site_year_sel %||% "All Years"
+    if (nzchar(yr_sel) && yr_sel != "All Years") df <- df[df$detYear == as.integer(yr_sel), , drop=FALSE]
+    if (!"site" %in% names(df)) df$site <- site_vec[!is.na(site_vec) & site_vec == toupper(st)]
+    if (!"file" %in% names(df)) df$file <- get_file_vec(df)
+    df
+  })
+  
+  build_unique_table <- function(df, blocklist=character(0)) {
+    if (!nrow(df)) return(data.frame(TagID=character(0)))
+    tag_col <- if ("tagID" %in% names(df)) "tagID" else if ("TagID" %in% names(df)) "TagID" else if ("PIT.Tag" %in% names(df)) "PIT.Tag" else NULL
+    if (is.null(tag_col)) return(data.frame(TagID=character(0)))
+    tags <- as.character(df[[tag_col]])
+    if (length(blocklist)) { keep <- !is.na(tags) & !(tags %in% blocklist); df <- df[keep, , drop=FALSE]; tags <- tags[keep] }
+    if (!nrow(df)) return(data.frame(TagID=character(0)))
+    df <- ensure_datetime(df)
+    pref <- if ("Event.Date" %in% names(df)) !is.na(df$Event.Date) else rep(FALSE, nrow(df))
+    ord <- order(pref, df$dateTime, decreasing=TRUE)
+    df2 <- df[ord, , drop=FALSE]
+    dedup_idx <- !duplicated(as.character(df2[[tag_col]]))
+    df2 <- df2[dedup_idx, , drop=FALSE]
+    tg <- as.character(df2[[tag_col]])
+    out <- data.frame(TagID = sprintf('<a href="#" class="go-fish" data-tag="%s">%s</a>', tg, tg), stringsAsFactors=FALSE)
+    meta_cols <- intersect(c("Event.Date","Stock","Acoustic.Tag","Release.Site","Event.Site","Release.Site.Name","Event.Site.Name"), names(df2))
+    if (length(meta_cols)) out <- cbind(out, df2[, meta_cols, drop=FALSE])
+    out$PTAGIS <- vapply(seq_len(nrow(df2)), function(i){
+      if (missing_taglist_meta(df2[i, , drop=FALSE])) ptagis_link_for(tg[i]) else ""
+    }, character(1))
+    out
+  }
+  
+  site_unique_df <- reactive({ build_unique_table(site_filtered(), bl_vec()) })
+  output$kpi_site_unique <- renderText({ if (is.null(active_df()) || !nrow(active_df())) "0" else nrow(site_unique_df()) })
+  output$tbl_site_unique <- renderDT({
+    if (is.null(active_df()) || !nrow(active_df())) return(datatable(data.frame(), rownames=FALSE))
+    df <- site_unique_df()
+    if (!nrow(df)) return(datatable(data.frame(), rownames=FALSE))
+    datatable(df, options=list(pageLength=25, scrollX=TRUE), escape=FALSE, rownames=FALSE,
+              callback = DT::JS("table.on('click','a.go-fish',function(e){e.preventDefault();var tg=$(this).data('tag');Shiny.setInputValue('go_fish_tag',tg,{priority:'event'});});"))
+  })
+  
+  output$tbl_site_dets <- renderDT({
+    if (is.null(active_df()) || !nrow(active_df())) return(datatable(data.frame(), rownames=FALSE))
+    df <- site_filtered()
+    if (!nrow(df)) return(datatable(data.frame(), rownames=FALSE))
+    if (!"site" %in% names(df)) df$site <- get_site_vec(df)
+    if (!"file" %in% names(df)) df$file <- get_file_vec(df)
+    tag_col <- if ("tagID" %in% names(df)) "tagID" else if ("TagID" %in% names(df)) "TagID" else if ("PIT.Tag" %in% names(df)) "PIT.Tag" else NULL
+    if (!is.null(tag_col)) df$TagID <- sprintf('<a href="#" class="go-fish" data-tag="%s">%s</a>', as.character(df[[tag_col]]), as.character(df[[tag_col]]))
+    cols <- c("dateTime","TagID","site","node","file","Stock","Event.Type","Organization","Event.Date","Brood.Year","Session","Acoustic.Tag","Length.FL","Length.TL","Release.Site","Event.Site","Release.Site.Name","Event.Site.Name")
+    cols <- intersect(cols, c(names(df),"TagID"))
+    datatable(df[, cols, drop=FALSE], options=list(pageLength=25, scrollX=TRUE), escape=FALSE, rownames=FALSE,
+              callback = DT::JS("table.on('click','a.go-fish',function(e){e.preventDefault();var tg=$(this).data('tag');Shiny.setInputValue('go_fish_tag',tg,{priority:'event'});});"))
+  })
+  
+  files_filtered <- reactive({
+    mer <- active_df(); if (is.null(mer)) return(data.frame())
+    mer <- ensure_datetime(mer)
+    file_vec <- get_file_vec(mer)
+    sel <- input$file_pick; if (!length(sel)) return(mer[0,,drop=FALSE])
+    df <- mer[!is.na(file_vec) & file_vec %in% sel, , drop=FALSE]
+    if (!"file" %in% names(df)) df$file <- get_file_vec(df)
+    if (!"site" %in% names(df)) df$site <- get_site_vec(df)
+    df[order(df$file, df$site, df$dateTime), ]
+  })
+  files_unique_df <- reactive({ build_unique_table(files_filtered(), bl_vec()) })
+  output$kpi_files_unique <- renderText({ if (is.null(active_df()) || !nrow(active_df())) "0" else nrow(files_unique_df()) })
+  output$tbl_files_unique <- renderDT({
+    if (is.null(active_df()) || !nrow(active_df())) return(datatable(data.frame(), rownames=FALSE))
+    df <- files_unique_df()
+    if (!nrow(df)) return(datatable(data.frame(), rownames=FALSE))
+    datatable(df, options=list(pageLength=25, scrollX=TRUE), escape=FALSE, rownames=FALSE,
+              callback = DT::JS("table.on('click','a.go-fish',function(e){e.preventDefault();var tg=$(this).data('tag');Shiny.setInputValue('go_fish_tag',tg,{priority:'event'});});"))
+  })
+  output$tbl_files_dets <- renderDT({
+    if (is.null(active_df()) || !nrow(active_df())) return(datatable(data.frame(), rownames=FALSE))
+    df <- files_filtered()
+    if (!nrow(df)) return(datatable(data.frame(), rownames=FALSE))
+    tag_col <- if ("tagID" %in% names(df)) "tagID" else if ("TagID" %in% names(df)) "TagID" else if ("PIT.Tag" %in% names(df)) "PIT.Tag" else NULL
+    if (!is.null(tag_col)) df$TagID <- sprintf('<a href="#" class="go-fish" data-tag="%s">%s</a>', as.character(df[[tag_col]]), as.character(df[[tag_col]]))
+    if (!"file" %in% names(df)) df$file <- get_file_vec(df)
+    if (!"site" %in% names(df)) df$site <- get_site_vec(df)
+    cols <- c("file","dateTime","TagID","site","node","Stock","Event.Type","Organization","Event.Date","Brood.Year","Session","Acoustic.Tag","Length.FL","Length.TL","Release.Site","Event.Site","Release.Site.Name","Event.Site.Name")
+    cols <- intersect(cols, c(names(df), "TagID"))
+    datatable(df[, cols, drop=FALSE], options=list(pageLength=25, scrollX=TRUE), escape=FALSE, rownames=FALSE,
+              callback = DT::JS("table.on('click','a.go-fish',function(e){e.preventDefault();var tg=$(this).data('tag');Shiny.setInputValue('go_fish_tag',tg,{priority:'event'});});"))
+  })
+  observeEvent(input$go_fish_tag, {
+    tg <- input$go_fish_tag
+    updateTextInput(session, "fish_tag_search", value=tg)
+    updateTabsetPanel(session, "tabs", selected="Fish")
+  })
+  
+  # ----- Upload ACTIVE dataset (confirm)
+  observeEvent(input$upload_btn, {
+    showModal(modalDialog(
+      title="Confirm upload",
+      "Save the ACTIVE dataset to the 'Compiled Data' folder? This will create/overwrite today's RDS.",
+      easyClose=FALSE,
+      footer=tagList(modalButton("Cancel"), actionButton("confirm_upload", "Proceed", class="btn-primary"))
+    ))
+  })
+  observeEvent(input$confirm_upload, {
+    removeModal()
+    p <- paths(); shiny::validate(shiny::need(!is.null(p), "Invalid profile"))
+    shiny::validate(shiny::need(dir.exists(p$compiled_dir), "Compiled Data folder does not exist"))
+    dat <- active_df(); shiny::validate(shiny::need(!is.null(dat) && nrow(dat)>0, "No active dataset to upload"))
+    stamp <- format(Sys.Date(), "%Y-%m-%d")
+    f2 <- file.path(p$compiled_dir, sprintf("allDets_with_BT&CT_tags_%s.rds", stamp))
+    ok <- tryCatch({ saveRDS(dat, f2); TRUE }, error=function(e) FALSE)
+    if (ok) showNotification(paste0("Uploaded: ", f2), type="message", duration=6) else showNotification("Upload failed (could not save RDS).", type="error")
+  })
+  
+  # ----- Paths & debug -----
+  output$paths_display <- renderText({
+    p <- paths(); if (is.null(p)) return("No profile")
+    tl <- input$taglist_pick %||% ""
+    cp <- input$compiled_pick %||% ""
+    show_tl <- if (nzchar(tl) && file.exists(tl) && is_under_dir(tl, p$taglist_dir)) tl else "(none for current profile)"
+    show_cp <- if (nzchar(cp) && file.exists(cp) && is_under_dir(cp, p$compiled_dir)) cp else "(none for current profile)"
+    paste(
+      sprintf("Download dir : %s", p$download_dir),
+      sprintf("Taglists dir : %s", p$taglist_dir),
+      sprintf("Compiled dir : %s", p$compiled_dir),
+      sprintf("VT file      : %s", p$vt_path),
+      sprintf("Pingers file : %s", p$junk_path),
+      sprintf("Antenna log  : %s", p$antenna_log %||% "(unset)"),
+      sprintf("Taglist sel  : %s", show_tl),
+      sprintf("Compiled sel : %s", show_cp),
+      sep="\n"
+    )
+  })
+  output$kpi_files_scanned <- renderText(length(scanned_files()))
+  output$kpi_files_new     <- renderText(new_files_ct())
+  output$kpi_rows_active   <- renderText({ df <- active_df(); if (is.null(df)) "0" else format(nrow(df), big.mark=",") })
+  output$debug_info <- renderPrint({
+    df <- active_df(); df <- ensure_datetime(df)
+    list(
+      newest_compiled    = newest_compiled_path(),
+      active_rows        = if (!is.null(df)) nrow(df) else 0,
+      site_head          = if (!is.null(df)) head(na.omit(unique(get_site_vec(df))), 10) else character(0),
+      file_head          = if (!is.null(df)) head(na.omit(unique(get_file_vec(df))), 10) else character(0),
+      has_tag_cols       = if (!is.null(df)) names(df)[tolower(names(df)) %in% c("tagid","pit.tag","tag")] else character(0),
+      years_available    = if (!is.null(df)) sort(na.omit(unique(df$detYear)), decreasing=TRUE) else integer(0)
+    )
+  })
+  
+  # ============================== LOG TAB ==============================
+  output$log_warn_openxlsx <- renderUI({
+    if (!has_openxlsx) div(class="mustload", "Package 'openxlsx' not installed — Antenna Log writing disabled.")
+  })
+  
+  # table of pending items
+  output$log_queue_tbl <- renderDT({
+    dq <- rv$log_queue
+    if (is.null(dq) || !nrow(dq)) return(datatable(data.frame(message="No pending entries. Upload files to populate."), options=list(dom='t'), rownames=FALSE))
+    datatable(dq, selection = "single", options=list(pageLength=6, dom='tip', order=list(list(0,'asc'))), rownames=FALSE)
+  })
+  
+  # Refresh PTAGIS control visibility (reads the chosen site's sheet)
+  refresh_ptagis_ui <- function(sel_site) {
+    p <- paths(); log_path <- p$antenna_log %||% ""
+    has_pt <- FALSE
+    if (has_openxlsx && nzchar(log_path) && file.exists(log_path)) {
+      pick <- open_wb_and_pick_sheet(log_path, sel_site)
+      if (is.null(pick$error)) {
+        df0 <- try(openxlsx::readWorkbook(pick$wb, sheet = pick$sheet), silent=TRUE)
+        if (!inherits(df0, "try-error") && is.data.frame(df0) && ncol(df0)) {
+          nm <- names(df0); nn <- norm_name(nm)
+          has_pt <- any(nn == "ptagis" | nn == "uploadedptagis" | nn == "uploadedtoptagis")
+        }
+      }
+    }
+    rv$log_sheet_has_ptagis <- has_pt
+    output$log_ptagis_ui <- renderUI({
+      if (isTRUE(rv$log_sheet_has_ptagis)) selectInput("log_ptagis", "PTAGIS", choices=c("Y","N"), selected="N")
+      else selectInput("log_ptagis", "PTAGIS", choices=c("N","Y"), selected="N",
+                       width="100%") # keep visible; if set to Y we'll add the column
+    })
+  }
+  
+  # when selection changes, populate form
+  observeEvent(input$log_queue_tbl_rows_selected, {
+    dq <- rv$log_queue; if (is.null(dq) || !nrow(dq)) return()
+    i <- input$log_queue_tbl_rows_selected
+    if (length(i)!=1) return()
+    sel <- dq[i, , drop=FALSE]
+    updateDateInput(session, "log_date", value = sel$Date %||% Sys.Date())
+    p <- paths(); init_now <- input$log_initials %||% ""
+    updateTextInput(session, "log_initials", value = if (nzchar(init_now)) init_now else (p$initials %||% ""))
+    updateSelectInput(session, "log_uploaded", selected="Y")
+    updateTextInput(session, "log_status", value = sel$Status %||% "Operational")
+    updateTextAreaInput(session, "log_comments", value = "")
+    refresh_ptagis_ui(as.character(sel$Site))
+  }, ignoreInit = TRUE)
+  
+  # default PTAGIS UI (before selection)
+  output$log_ptagis_ui <- renderUI({ selectInput("log_ptagis", "PTAGIS", choices=c("N","Y"), selected="N") })
+  
+  # Append ONE
+  observeEvent(input$log_append_btn, {
+    if (!has_openxlsx) { showNotification("Install 'openxlsx' to write the Antenna Log.", type="error"); return() }
+    dq <- rv$log_queue
+    if (is.null(dq) || !nrow(dq)) { showNotification("No pending entry selected.", type="warning"); return() }
+    i <- input$log_queue_tbl_rows_selected
+    if (length(i)!=1) { showNotification("Select one pending row first.", type="warning"); return() }
+    row <- dq[i, , drop=FALSE]
+    p <- paths(); log_path <- p$antenna_log %||% ""
+    if (!nzchar(log_path)) { showNotification("Antenna log path not set for this profile.", type="error"); return() }
+    
+    # Gather form values
+    Date <- as.character(input$log_date %||% Sys.Date())
+    Initials <- trimws(input$log_initials %||% "")
+    if (!nzchar(Initials)) { showNotification("Enter your initials.", type="warning"); return() }
+    Uploaded <- as.character(input$log_uploaded %||% "Y")
+    PTagis   <- as.character(input$log_ptagis %||% "N")
+    Status   <- trimws(input$log_status %||% "Operational")
+    Comments <- as.character(input$log_comments %||% "")
+    Site     <- as.character(row$Site)
+    
+    res <- append_one_row(log_path, Site, Date, Initials, Uploaded, PTagis, Status, Comments,
+                          force_add_ptagis = (toupper(PTagis)=="Y"))
+    if (!isTRUE(res$ok)) {
+      output$log_result <- renderText(sprintf("Append failed — %s", res$msg))
+      showNotification("Write failed.", type="error")
+      return()
+    }
+    
+    # Success: remove from queue + tell the user exactly where it went
+    rv$log_queue <- dq[-i, , drop=FALSE]
+    output$log_queue_tbl <- renderDT({
+      dq2 <- rv$log_queue
+      if (is.null(dq2) || !nrow(dq2)) return(datatable(data.frame(message="All pending entries logged."), options=list(dom='t'), rownames=FALSE))
+      datatable(dq2, selection = "single", options=list(pageLength=6, dom='tip'), rownames=FALSE)
+    })
+    output$log_result <- renderText(sprintf("Appended to '%s'  |  Sheet: %s  |  Row: %s\nDate: %s  Initials: %s  Uploaded: %s  PTAGIS: %s  Status: %s\nComments: %s",
+                                            log_path, res$sheet, res$row_index,
+                                            Date, Initials, Uploaded, ifelse(toupper(PTagis)=="Y","Y","N"), Status, Comments))
+    showNotification(sprintf("Antenna Log updated (sheet %s, row %s).", res$sheet, res$row_index), type="message")
+  })
+  
+  # Append ALL
+  observeEvent(input$log_append_all_btn, {
+    if (!has_openxlsx) { showNotification("Install 'openxlsx' to write the Antenna Log.", type="error"); return() }
+    dq <- rv$log_queue
+    if (is.null(dq) || !nrow(dq)) { showNotification("No pending entries.", type="warning"); return() }
+    p <- paths(); log_path <- p$antenna_log %||% ""
+    if (!nzchar(log_path)) { showNotification("Antenna log path not set for this profile.", type="error"); return() }
+    
+    Initials <- trimws(input$log_initials %||% "")
+    if (!nzchar(Initials)) { showNotification("Enter your initials first.", type="warning"); return() }
+    Uploaded <- as.character(input$log_uploaded %||% "Y")
+    Status   <- trimws(input$log_status %||% "Operational")
+    Comments <- as.character(input$log_comments %||% "")
+    PTagis   <- as.character(input$log_ptagis %||% "N")
+    
+    results <- lapply(seq_len(nrow(dq)), function(i){
+      Date <- as.character(dq$Date[i] %||% Sys.Date())
+      Site <- as.character(dq$Site[i])
+      append_one_row(log_path, Site, Date, Initials, Uploaded, PTagis, Status, Comments,
+                     force_add_ptagis = (toupper(PTagis)=="Y"))
+    })
+    ok_ct <- sum(vapply(results, function(r) isTRUE(r$ok), logical(1)))
+    rv$log_queue <- dq[0, , drop=FALSE]
+    output$log_queue_tbl <- renderDT(datatable(data.frame(message=sprintf("Appended %d row(s).", ok_ct)), options=list(dom='t'), rownames=FALSE))
+    output$log_result <- renderText(paste0(vapply(results, function(r){
+      if (isTRUE(r$ok)) sprintf("OK -> Sheet: %s  Row: %s", r$sheet, r$row_index) else sprintf("FAIL -> %s", r$msg)
+    }, character(1)), collapse="\n"))
+    showNotification(sprintf("Antenna Log updated (%d row(s)).", ok_ct), type="message")
+  })
+  
+  observeEvent(input$log_refresh_btn, {
+    i <- input$log_queue_tbl_rows_selected
+    if (!length(i)) { showNotification("Select a pending row first.", type="warning"); return() }
+    dq <- rv$log_queue; if (is.null(dq) || !nrow(dq)) return()
+    refresh_ptagis_ui(as.character(dq$Site[i]))
+    showNotification("Refreshed sheet metadata.", type="message")
+  })
+}
+
+shinyApp(ui, server)
