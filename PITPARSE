@@ -385,9 +385,10 @@ ui <- fluidPage(
                                ),
                                textAreaInput("log_comments", "Comments", value = "", resize="vertical", width="100%"),
                                fluidRow(
-                                 column(4, actionButton("log_append_btn", "Append to Antenna Log.xlsx", class="btn-primary", width="100%")),
-                                 column(4, actionButton("log_append_all_btn", "Append ALL pending", class="btn-warning", width="100%")),
-                                 column(4, actionButton("log_refresh_btn", "Refresh sheet meta", class="btn-secondary", width="100%"))
+                                 column(3, actionButton("log_update_btn", "Update pending row", class="btn-secondary", width="100%")),
+                                 column(3, actionButton("log_append_btn", "Append selected", class="btn-primary", width="100%")),
+                                 column(3, actionButton("log_append_all_btn", "Append ALL pending", class="btn-warning", width="100%")),
+                                 column(3, actionButton("log_refresh_btn", "Refresh sheet meta", class="btn-secondary", width="100%"))
                                ),
                                tags$br(),
                                verbatimTextOutput("log_result")
@@ -896,16 +897,22 @@ server <- function(input, output, session) {
         item <- rv$review_data[[ names_in[i] ]]
         any(!is.null(item) && !is.null(item$alarms_list) && nrow(item$alarms_list) > 0)
       }, logical(1))
+      p <- paths()
+      init_default <- p$initials %||% ""
       rv$log_queue <- data.frame(
-        File   = names_in,
-        Site   = toupper(sapply(names_in, derive_site_from_name)),
-        Date   = as.Date(ifelse(is.na(derive_date_from_name(names_in)), Sys.Date(), derive_date_from_name(names_in)), origin="1970-01-01"),
-        Status = ifelse(alarm_flag, "Alarm", "Operational"),
+        File     = names_in,
+        Site     = toupper(sapply(names_in, derive_site_from_name)),
+        Date     = as.Date(ifelse(is.na(derive_date_from_name(names_in)), Sys.Date(), derive_date_from_name(names_in)), origin="1970-01-01"),
+        Initials = init_default,
+        Uploaded = "Y",
+        PTAGIS   = "N",
+        Status   = ifelse(alarm_flag, "Alarm", "Operational"),
+        Comments = "",
         stringsAsFactors = FALSE
       )
-      p <- paths()
-      updateTextInput(session, "log_initials", value = (p$initials %||% ""))
+      updateTextInput(session, "log_initials", value = init_default)
       updateSelectInput(session, "log_uploaded", selected="Y")
+      updateSelectInput(session, "log_ptagis", selected="N")
       updateTextInput(session, "log_status", value = "Operational")
       updateTextAreaInput(session, "log_comments", value = "")
       updateTabsetPanel(session, "tabs", selected="Log")
@@ -1120,11 +1127,11 @@ server <- function(input, output, session) {
   output$log_queue_tbl <- renderDT({
     dq <- rv$log_queue
     if (is.null(dq) || !nrow(dq)) return(datatable(data.frame(message="No pending entries. Upload files to populate."), options=list(dom='t'), rownames=FALSE))
-    datatable(dq, selection = "single", options=list(pageLength=6, dom='tip', order=list(list(0,'asc'))), rownames=FALSE)
+    datatable(dq, selection = "single", options=list(pageLength=6, dom='tip', order=list(list(0,'asc')), scrollX=TRUE), rownames=FALSE)
   })
   
   # Refresh PTAGIS control visibility (reads the chosen site's sheet)
-  refresh_ptagis_ui <- function(sel_site) {
+  refresh_ptagis_ui <- function(sel_site, sel_value="N") {
     p <- paths(); log_path <- p$antenna_log %||% ""
     has_pt <- FALSE
     if (has_openxlsx && nzchar(log_path) && file.exists(log_path)) {
@@ -1139,8 +1146,8 @@ server <- function(input, output, session) {
     }
     rv$log_sheet_has_ptagis <- has_pt
     output$log_ptagis_ui <- renderUI({
-      if (isTRUE(rv$log_sheet_has_ptagis)) selectInput("log_ptagis", "PTAGIS", choices=c("Y","N"), selected="N")
-      else selectInput("log_ptagis", "PTAGIS", choices=c("N","Y"), selected="N",
+      if (isTRUE(rv$log_sheet_has_ptagis)) selectInput("log_ptagis", "PTAGIS", choices=c("Y","N"), selected=sel_value)
+      else selectInput("log_ptagis", "PTAGIS", choices=c("N","Y"), selected=sel_value,
                        width="100%") # keep visible; if set to Y we'll add the column
     })
   }
@@ -1151,18 +1158,33 @@ server <- function(input, output, session) {
     i <- input$log_queue_tbl_rows_selected
     if (length(i)!=1) return()
     sel <- dq[i, , drop=FALSE]
+    p <- paths()
     updateDateInput(session, "log_date", value = sel$Date %||% Sys.Date())
-    p <- paths(); init_now <- input$log_initials %||% ""
-    updateTextInput(session, "log_initials", value = if (nzchar(init_now)) init_now else (p$initials %||% ""))
-    updateSelectInput(session, "log_uploaded", selected="Y")
+    updateTextInput(session, "log_initials", value = sel$Initials %||% (p$initials %||% ""))
+    updateSelectInput(session, "log_uploaded", selected = sel$Uploaded %||% "Y")
     updateTextInput(session, "log_status", value = sel$Status %||% "Operational")
-    updateTextAreaInput(session, "log_comments", value = "")
-    refresh_ptagis_ui(as.character(sel$Site))
+    updateTextAreaInput(session, "log_comments", value = sel$Comments %||% "")
+    refresh_ptagis_ui(as.character(sel$Site), sel$PTAGIS %||% "N")
   }, ignoreInit = TRUE)
   
   # default PTAGIS UI (before selection)
   output$log_ptagis_ui <- renderUI({ selectInput("log_ptagis", "PTAGIS", choices=c("N","Y"), selected="N") })
-  
+
+  observeEvent(input$log_update_btn, {
+    dq <- rv$log_queue
+    if (is.null(dq) || !nrow(dq)) { showNotification("No pending entry selected.", type="warning"); return() }
+    i <- input$log_queue_tbl_rows_selected
+    if (length(i) != 1) { showNotification("Select one pending row first.", type="warning"); return() }
+    dq$Date[i]     <- as.Date(input$log_date %||% Sys.Date())
+    dq$Initials[i] <- trimws(input$log_initials %||% "")
+    dq$Uploaded[i] <- as.character(input$log_uploaded %||% "Y")
+    dq$PTAGIS[i]   <- as.character(input$log_ptagis %||% "N")
+    dq$Status[i]   <- trimws(input$log_status %||% "Operational")
+    dq$Comments[i] <- as.character(input$log_comments %||% "")
+    rv$log_queue <- dq
+    showNotification("Pending entry updated.", type="message")
+  })
+
   # Append ONE
   observeEvent(input$log_append_btn, {
     if (!has_openxlsx) { showNotification("Install 'openxlsx' to write the Antenna Log.", type="error"); return() }
@@ -1183,7 +1205,15 @@ server <- function(input, output, session) {
     Status   <- trimws(input$log_status %||% "Operational")
     Comments <- as.character(input$log_comments %||% "")
     Site     <- as.character(row$Site)
-    
+
+    dq$Date[i]     <- as.Date(Date)
+    dq$Initials[i] <- Initials
+    dq$Uploaded[i] <- Uploaded
+    dq$PTAGIS[i]   <- PTagis
+    dq$Status[i]   <- Status
+    dq$Comments[i] <- Comments
+    rv$log_queue <- dq
+
     res <- append_one_row(log_path, Site, Date, Initials, Uploaded, PTagis, Status, Comments,
                           force_add_ptagis = (toupper(PTagis)=="Y"))
     if (!isTRUE(res$ok)) {
@@ -1197,7 +1227,7 @@ server <- function(input, output, session) {
     output$log_queue_tbl <- renderDT({
       dq2 <- rv$log_queue
       if (is.null(dq2) || !nrow(dq2)) return(datatable(data.frame(message="All pending entries logged."), options=list(dom='t'), rownames=FALSE))
-      datatable(dq2, selection = "single", options=list(pageLength=6, dom='tip'), rownames=FALSE)
+      datatable(dq2, selection = "single", options=list(pageLength=6, dom='tip', scrollX=TRUE), rownames=FALSE)
     })
     output$log_result <- renderText(sprintf("Appended to '%s'  |  Sheet: %s  |  Row: %s\nDate: %s  Initials: %s  Uploaded: %s  PTAGIS: %s  Status: %s\nComments: %s",
                                             log_path, res$sheet, res$row_index,
@@ -1213,16 +1243,16 @@ server <- function(input, output, session) {
     p <- paths(); log_path <- p$antenna_log %||% ""
     if (!nzchar(log_path)) { showNotification("Antenna log path not set for this profile.", type="error"); return() }
     
-    Initials <- trimws(input$log_initials %||% "")
-    if (!nzchar(Initials)) { showNotification("Enter your initials first.", type="warning"); return() }
-    Uploaded <- as.character(input$log_uploaded %||% "Y")
-    Status   <- trimws(input$log_status %||% "Operational")
-    Comments <- as.character(input$log_comments %||% "")
-    PTagis   <- as.character(input$log_ptagis %||% "N")
-    
+    if (any(!nzchar(trimws(dq$Initials)))) { showNotification("Initials missing for one or more rows.", type="warning"); return() }
+
     results <- lapply(seq_len(nrow(dq)), function(i){
-      Date <- as.character(dq$Date[i] %||% Sys.Date())
-      Site <- as.character(dq$Site[i])
+      Date     <- as.character(dq$Date[i] %||% Sys.Date())
+      Site     <- as.character(dq$Site[i])
+      Initials <- trimws(dq$Initials[i] %||% "")
+      Uploaded <- as.character(dq$Uploaded[i] %||% "Y")
+      PTagis   <- as.character(dq$PTAGIS[i] %||% "N")
+      Status   <- trimws(dq$Status[i] %||% "Operational")
+      Comments <- as.character(dq$Comments[i] %||% "")
       append_one_row(log_path, Site, Date, Initials, Uploaded, PTagis, Status, Comments,
                      force_add_ptagis = (toupper(PTagis)=="Y"))
     })
@@ -1239,7 +1269,7 @@ server <- function(input, output, session) {
     i <- input$log_queue_tbl_rows_selected
     if (!length(i)) { showNotification("Select a pending row first.", type="warning"); return() }
     dq <- rv$log_queue; if (is.null(dq) || !nrow(dq)) return()
-    refresh_ptagis_ui(as.character(dq$Site[i]))
+    refresh_ptagis_ui(as.character(dq$Site[i]), dq$PTAGIS[i] %||% "N")
     showNotification("Refreshed sheet metadata.", type="message")
   })
 }
