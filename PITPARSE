@@ -21,10 +21,16 @@ has_openxlsx <- requireNamespace("openxlsx", quietly = TRUE)
 has_rsqlite  <- requireNamespace("RSQLite", quietly = TRUE)
 
 # Shared log database path (override with PITPARSE_LOG_DB_PATH env var)
-LOG_DB_PATH <- Sys.getenv(
-  "PITPARSE_LOG_DB_PATH",
-  "\\\\fileserver\\\\MCFWCO\\\\AntennaData\\\\AntennaLog\\\\antenna_log.sqlite"
+user_name <- Sys.getenv("USERNAME")
+if (!nzchar(user_name)) user_name <- Sys.getenv("USER")
+default_log_db <- file.path(
+  "C:/Users",
+  user_name,
+  "DOI", "MCFWCO Yakima Sub-Office - Documents",
+  "General", "Antenna Data",
+  "antenna_log.sqlite"
 )
+LOG_DB_PATH <- Sys.getenv("PITPARSE_LOG_DB_PATH", default_log_db)
 
 open_log_db <- function() {
   if (!has_rsqlite) return(NULL)
