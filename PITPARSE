@@ -462,24 +462,27 @@ server <- function(input, output, session) {
       df0 <- df0[0, , drop = FALSE]
     }
 
-    # Build a new row aligned purely by column order
-    new_row <- setNames(vector("list", length(headers_now)), headers_now)
+    # Build a new row aligned purely by column index so the appender
+    # is agnostic to existing header names (only their order matters).
+    new_row <- vector("list", length(headers_now))
     new_row[[1]] <- format(as.Date(Date), "%m/%d/%y")
     new_row[[2]] <- Personnel
     new_row[[3]] <- Downloaded
     idx <- 3
     if (need_ptagis) {
       idx <- idx + 1
-      new_row[[4]] <- PTagis %||% "N"
+      new_row[[idx]] <- PTagis %||% "N"
     }
     new_row[[idx + 1]] <- Status
     new_row[[idx + 2]] <- Comments
 
-    # Ensure all columns have a value so as.data.frame() doesn't error on NULL
+    # Ensure each column has a value so as.data.frame() doesn't error on NULL
     new_row <- lapply(new_row, function(x) if (is.null(x) || length(x) == 0) NA_character_ else x)
     append_df <- as.data.frame(new_row, stringsAsFactors = FALSE)
+    colnames(append_df) <- headers_now
     start_row <- nrow(df0) + 2  # row 1 header, so first data row = 2
-    openxlsx::writeData(wb, sheet = sheet, x = append_df, startRow = start_row, colNames = FALSE, withFilter = FALSE)
+    openxlsx::writeData(wb, sheet = sheet, x = append_df, startRow = start_row,
+                        startCol = 1, colNames = FALSE, withFilter = FALSE)
 
     old_mtime <- if (file.exists(path)) file.info(path)$mtime else NA
     ok <- try(openxlsx::saveWorkbook(wb, file = path, overwrite = TRUE), silent = TRUE)
