@@ -396,9 +396,10 @@ ui <- fluidPage(
                   tabPanel("Sites",
                            div(class="section",
                                fluidRow(
-                                 column(4, selectInput("site_pick", "Site", choices=character(0))),
-                                 column(4, uiOutput("site_year_ui")),
-                                 column(4, downloadButton("dl_site_csv", "CSV"))
+                                 column(3, selectInput("site_pick", "Site", choices=character(0))),
+                                 column(3, uiOutput("site_year_ui")),
+                                 column(4, uiOutput("site_date_range_ui")),
+                                 column(2, downloadButton("dl_site_csv", "CSV"))
                                ),
                                h5("Unique tags at site"),
                                div(class="kpi", div(class="big", textOutput("kpi_site_unique", inline=TRUE)), div(class="small","unique tags")),
@@ -586,6 +587,16 @@ server <- function(input, output, session) {
   })
   output$fish_year_ui <- renderUI({ selectInput("fish_year_sel", "Year", choices=years_choices(), selected="All Years", width="100%") })
   output$site_year_ui <- renderUI({ selectInput("site_year_sel", "Year", choices=years_choices(), selected="All Years", width="100%") })
+  output$site_date_range_ui <- renderUI({
+    df <- active_df()
+    if (is.null(df) || !nrow(df) || !("dateTime" %in% names(df))) {
+      dateRangeInput("site_date_range", "Date range", start = Sys.Date() - 30, end = Sys.Date(), width="100%")
+    } else {
+      df <- ensure_datetime(df)
+      rng <- range(as.Date(df$dateTime), na.rm = TRUE)
+      dateRangeInput("site_date_range", "Date range", start = rng[1], end = rng[2], width="100%")
+    }
+  })
   
   # ----- Load compiled
   observeEvent(input$load_compiled_btn, {
@@ -987,6 +998,11 @@ server <- function(input, output, session) {
     df <- mer[!is.na(site_vec) & site_vec == toupper(st), , drop=FALSE]
     yr_sel <- input$site_year_sel %||% "All Years"
     if (nzchar(yr_sel) && yr_sel != "All Years") df <- df[df$detYear == as.integer(yr_sel), , drop=FALSE]
+    dr <- input$site_date_range
+    if (!is.null(dr) && length(dr) == 2) {
+      dts <- as.Date(df$dateTime)
+      df <- df[dts >= dr[1] & dts <= dr[2], , drop=FALSE]
+    }
     if (!"site" %in% names(df)) df$site <- site_vec[!is.na(site_vec) & site_vec == toupper(st)]
     if (!"file" %in% names(df)) df$file <- get_file_vec(df)
     df
@@ -1273,7 +1289,14 @@ server <- function(input, output, session) {
     i <- input$log_queue_tbl_rows_selected
     if (!length(i)) { showNotification("Select a pending row first.", type="warning"); return() }
     dq <- rv$log_queue; if (is.null(dq) || !nrow(dq)) return()
-    refresh_ptagis_ui(as.character(dq$Site[i]), dq$PTAGIS[i] %||% "N")
+    sel <- dq[i, , drop=FALSE]
+    p <- paths()
+    updateDateInput(session, "log_date", value = sel$Date %||% Sys.Date())
+    updateTextInput(session, "log_personnel", value = sel$Personnel %||% (p$initials %||% ""))
+    updateSelectInput(session, "log_downloaded", selected = sel$Downloaded %||% "Y")
+    refresh_ptagis_ui(as.character(sel$Site), sel$PTAGIS %||% "N")
+    updateTextInput(session, "log_status", value = sel$Status %||% "Operational")
+    updateTextAreaInput(session, "log_comments", value = sel$Comments %||% "")
     showNotification("Refreshed controls.", type="message")
   })
 
