@@ -480,16 +480,18 @@ server <- function(input, output, session) {
     new_row <- lapply(new_row, function(x) if (is.null(x) || length(x) == 0) NA_character_ else x)
     append_df <- as.data.frame(new_row, stringsAsFactors = FALSE)
     colnames(append_df) <- headers_now
-    start_row <- nrow(df0) + 2  # row 1 header, so first data row = 2
-    openxlsx::writeData(wb, sheet = sheet, x = append_df, startRow = start_row,
-                        startCol = 1, colNames = FALSE, withFilter = FALSE)
+    row_index <- nrow(df0) + 2  # row 1 header, so first data row = 2
+    df_all <- rbind(df0, append_df)
+    # Rewrite entire sheet to avoid append failures on certain workbooks
+    openxlsx::writeData(wb, sheet = sheet, x = df_all, startRow = 1, startCol = 1,
+                        colNames = TRUE, withFilter = FALSE)
 
     old_mtime <- if (file.exists(path)) file.info(path)$mtime else NA
     ok <- try(openxlsx::saveWorkbook(wb, file = path, overwrite = TRUE), silent = TRUE)
     new_mtime <- if (file.exists(path)) file.info(path)$mtime else NA
     if (inherits(ok, "try-error") || is.na(new_mtime) || (!is.na(old_mtime) && new_mtime <= old_mtime))
       return(list(ok=FALSE, row_index=NA_integer_, sheet=sheet, msg="Save failed (file open/locked or permission denied)"))
-    list(ok=TRUE, row_index=start_row, sheet=sheet, msg="OK")
+    list(ok=TRUE, row_index=row_index, sheet=sheet, msg="OK")
   }
   
   # ---------- Active dataset presence flag ----------
