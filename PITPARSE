@@ -185,10 +185,26 @@ derive_date_from_name <- function(fname) {
 # ---- Column-agnostic extractors ----
 get_file_vec <- function(df) {
   n <- nrow(df); if (is.null(n) || !n) return(character(0))
+  nm <- tolower(names(df))
   out <- rep(NA_character_, n)
-  if ("file" %in% names(df))      { v <- as.character(df$file);      out[is.na(out) | !nzchar(out)] <- v[is.na(out) | !nzchar(out)] }
-  if ("fileName" %in% names(df))  { v <- as.character(df$fileName);  out[is.na(out) | !nzchar(out)] <- v[is.na(out) | !nzchar(out)] }
-  if ("path" %in% names(df))      { v <- basename(as.character(df$path)); out[is.na(out) | !nzchar(out)] <- v[is.na(out) | !nzchar(out)] }
+
+  pick <- function(target) {
+    idx <- which(nm == target)
+    if (length(idx)) as.character(df[[idx[1]]]) else NULL
+  }
+
+  v <- pick("file")
+  if (!is.null(v)) out[is.na(out) | !nzchar(out)] <- v[is.na(out) | !nzchar(out)]
+
+  v <- pick("filename")
+  if (!is.null(v)) out[is.na(out) | !nzchar(out)] <- v[is.na(out) | !nzchar(out)]
+
+  v <- pick("path")
+  if (!is.null(v)) {
+    v <- basename(v)
+    out[is.na(out) | !nzchar(out)] <- v[is.na(out) | !nzchar(out)]
+  }
+
   out
 }
 get_site_vec <- function(df) {
@@ -630,17 +646,17 @@ server <- function(input, output, session) {
     already <- character(0)
     if (!is.null(cur)) {
       fv <- get_file_vec(cur)
-      already <- unique(fv[!is.na(fv) & nzchar(fv)])
+      already <- unique(tolower(fv[!is.na(fv) & nzchar(fv)]))
     }
-    files_new <- setdiff(basename(files_all), basename(already))
+    files_new <- files_all[!(tolower(basename(files_all)) %in% already)]
     if (!length(files_new)) { new_files_ct(0); showNotification("No new files found. Dataset unchanged.", type="message"); return() }
-    
+
     withProgress(message=paste0("Parsing ", length(files_new), " new file(s)…"), value=0, {
       parts <- vector("list", length(files_new))
       for (i in seq_along(files_new)) {
-        fpath <- files_all[basename(files_all) == files_new[i]][1]
+        fpath <- files_new[i]
         parts[[i]] <- parse_one_file(fpath)
-        incProgress(i/length(files_new), detail = files_new[i])
+        incProgress(i/length(files_new), detail = basename(fpath))
       }
       dat_new <- do.call(rbind, parts)
     })
