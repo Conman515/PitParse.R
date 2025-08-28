@@ -1302,17 +1302,13 @@ server <- function(input, output, session) {
     })
   
   observeEvent(input$log_refresh_btn, {
-    i <- input$log_queue_tbl_rows_selected
-    if (!length(i)) { showNotification("Select a pending row first.", type="warning"); return() }
-    dq <- rv$log_queue; if (is.null(dq) || !nrow(dq)) return()
-    sel <- dq[i, , drop=FALSE]
     p <- paths()
-    updateDateInput(session, "log_date", value = sel$Date %||% Sys.Date())
-    updateTextInput(session, "log_personnel", value = sel$Personnel %||% (p$initials %||% ""))
-    updateSelectInput(session, "log_downloaded", selected = sel$Downloaded %||% "Y")
-    refresh_ptagis_ui(as.character(sel$Site), sel$PTAGIS %||% "N")
-    updateTextInput(session, "log_status", value = sel$Status %||% "Operational")
-    updateTextAreaInput(session, "log_comments", value = sel$Comments %||% "")
+    updateDateInput(session, "log_date", value = Sys.Date())
+    updateTextInput(session, "log_personnel", value = p$initials %||% "")
+    updateSelectInput(session, "log_downloaded", selected = "Y")
+    refresh_ptagis_ui("", "N")
+    updateTextInput(session, "log_status", value = "Operational")
+    updateTextAreaInput(session, "log_comments", value = "")
     showNotification("Refreshed controls.", type="message")
   })
 
