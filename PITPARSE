@@ -445,12 +445,17 @@ ui <- fluidPage(
                                ),
                                fluidRow(
                                  column(3, downloadButton("log_export_xlsx", "Export to Excel", class="btn-secondary", width="100%")),
-                                 column(3, downloadButton("log_export_csv", "Export to CSV", class="btn-secondary", width="100%"))
-                               ),
-                               tags$br(),
-                               verbatimTextOutput("log_result")
-                           )
-                  )
+                                  column(3, downloadButton("log_export_csv", "Export to CSV", class="btn-secondary", width="100%"))
+                                ),
+                                tags$br(),
+                                verbatimTextOutput("log_result"),
+                                tags$hr(),
+                                h4("View existing logs"),
+                                uiOutput("log_view_site_ui"),
+                                DTOutput("log_view_tbl"),
+                                actionButton("log_delete_entry", "Delete selected", class="btn-danger")
+                             )
+                   )
       ),
       br(),
       tags$details(tags$summary("Debug / Info"), verbatimTextOutput("debug_info"))
@@ -478,6 +483,34 @@ server <- function(input, output, session) {
     }
     list(ok=FALSE, id=NA_integer_, site=site, msg="Database busy or locked")
   }
+
+  fetch_log_sites <- function() {
+    if (is.null(log_db) || !DBI::dbIsValid(log_db)) return(character())
+    tryCatch(DBI::dbGetQuery(log_db, "SELECT DISTINCT site FROM antenna_log ORDER BY site")$site,
+             error = function(e) character())
+  }
+
+  fetch_logs_by_site <- function(site) {
+    if (is.null(log_db) || !DBI::dbIsValid(log_db)) return(data.frame())
+    tryCatch(DBI::dbGetQuery(log_db,
+                             "SELECT id, date, personnel, downloaded, ptagis, status, comments FROM antenna_log WHERE site=? ORDER BY date DESC",
+                             params = list(site)),
+             error = function(e) data.frame())
+  }
+
+  update_log_entry <- function(id, field, value) {
+    if (is.null(log_db) || !DBI::dbIsValid(log_db)) return()
+    q <- sprintf("UPDATE antenna_log SET %s=? WHERE id=?", field)
+    DBI::dbExecute(log_db, q, params = list(value, id))
+  }
+
+  delete_log_entry <- function(id) {
+    if (is.null(log_db) || !DBI::dbIsValid(log_db)) return()
+    DBI::dbExecute(log_db, "DELETE FROM antenna_log WHERE id=?", params = list(id))
+  }
+
+  log_sites <- reactiveVal(fetch_log_sites())
+  log_view_data <- reactiveVal(data.frame())
   
   # ---------- Active dataset presence flag ----------
   output$must_load_banner <- renderUI({
@@ -1197,11 +1230,14 @@ server <- function(input, output, session) {
       if (is.null(dq2) || !nrow(dq2)) return(datatable(data.frame(message="All pending entries logged."), options=list(dom='t'), rownames=FALSE))
       datatable(dq2, selection = "single", options=list(pageLength=6, dom='tip', scrollX=TRUE), rownames=FALSE)
     })
-    output$log_result <- renderText(sprintf("Appended to '%s'  |  Site: %s  |  ID: %s\nDate: %s  Personnel: %s  Downloaded?: %s  Uploaded to PTAGIS?: %s  Status: %s\nComments: %s",
-                                            LOG_DB_PATH, res$site, res$id,
-                                            format(Date, "%m/%d/%y"), Personnel, Downloaded, ifelse(toupper(PTagis)=="Y","Y","N"), Status, Comments))
-    showNotification(sprintf("Antenna Log updated (ID %s).", res$id), type="message")
-  })
+      output$log_result <- renderText(sprintf("Appended to '%s'  |  Site: %s  |  ID: %s\nDate: %s  Personnel: %s  Downloaded?: %s  Uploaded to PTAGIS?: %s  Status: %s\nComments: %s",
+                                              LOG_DB_PATH, res$site, res$id,
+                                              format(Date, "%m/%d/%y"), Personnel, Downloaded, ifelse(toupper(PTagis)=="Y","Y","N"), Status, Comments))
+      showNotification(sprintf("Antenna Log updated (ID %s).", res$id), type="message")
+      log_sites(fetch_log_sites())
+      if (!is.null(input$log_view_site) && input$log_view_site == Site)
+        log_view_data(fetch_logs_by_site(Site))
+    })
   
   # Append ALL
   observeEvent(input$log_append_all_btn, {
@@ -1224,11 +1260,14 @@ server <- function(input, output, session) {
     ok_ct <- sum(vapply(results, function(r) isTRUE(r$ok), logical(1)))
     rv$log_queue <- dq[0, , drop=FALSE]
     output$log_queue_tbl <- renderDT(datatable(data.frame(message=sprintf("Appended %d row(s).", ok_ct)), options=list(dom='t'), rownames=FALSE))
-    output$log_result <- renderText(paste0(vapply(results, function(r){
-      if (isTRUE(r$ok)) sprintf("OK -> Site: %s  ID: %s", r$site, r$id) else sprintf("FAIL -> %s", r$msg)
-    }, character(1)), collapse="\n"))
-    showNotification(sprintf("Antenna Log updated (%d row(s)).", ok_ct), type="message")
-  })
+      output$log_result <- renderText(paste0(vapply(results, function(r){
+        if (isTRUE(r$ok)) sprintf("OK -> Site: %s  ID: %s", r$site, r$id) else sprintf("FAIL -> %s", r$msg)
+      }, character(1)), collapse="\n"))
+      showNotification(sprintf("Antenna Log updated (%d row(s)).", ok_ct), type="message")
+      log_sites(fetch_log_sites())
+      if (!is.null(input$log_view_site))
+        log_view_data(fetch_logs_by_site(input$log_view_site))
+    })
   
   observeEvent(input$log_refresh_btn, {
     i <- input$log_queue_tbl_rows_selected
@@ -1247,22 +1286,67 @@ server <- function(input, output, session) {
     }
   )
 
-  output$log_export_xlsx <- downloadHandler(
-    filename = function() sprintf("antenna_log_%s.xlsx", Sys.Date()),
-    content = function(file) {
-      if (!has_openxlsx) stop("openxlsx not installed")
-      if (is.null(log_db) || !DBI::dbIsValid(log_db)) stop("Database not available")
-      df <- DBI::dbGetQuery(log_db, "SELECT * FROM antenna_log ORDER BY date")
-      wb <- openxlsx::createWorkbook()
-      sp <- split(df, df$site)
-      if (length(sp) == 0) sp <- list(Log = df)
-      for (nm in names(sp)) {
-        openxlsx::addWorksheet(wb, nm)
-        openxlsx::writeData(wb, nm, sp[[nm]], withFilter = FALSE)
+    output$log_export_xlsx <- downloadHandler(
+      filename = function() sprintf("antenna_log_%s.xlsx", Sys.Date()),
+      content = function(file) {
+        if (!has_openxlsx) stop("openxlsx not installed")
+        if (is.null(log_db) || !DBI::dbIsValid(log_db)) stop("Database not available")
+        df <- DBI::dbGetQuery(log_db, "SELECT * FROM antenna_log ORDER BY date")
+        wb <- openxlsx::createWorkbook()
+        sp <- split(df, df$site)
+        if (length(sp) == 0) sp <- list(Log = df)
+        for (nm in names(sp)) {
+          openxlsx::addWorksheet(wb, nm)
+          openxlsx::writeData(wb, nm, sp[[nm]], withFilter = FALSE)
+        }
+        openxlsx::saveWorkbook(wb, file, overwrite = TRUE)
       }
-      openxlsx::saveWorkbook(wb, file, overwrite = TRUE)
-    }
-  )
+    )
+
+    output$log_view_site_ui <- renderUI({
+      selectInput("log_view_site", "Site", choices = log_sites())
+    })
+
+    observeEvent(input$log_view_site, {
+      log_view_data(fetch_logs_by_site(input$log_view_site))
+    })
+
+    output$log_view_tbl <- renderDT({
+      df <- log_view_data()
+      if (is.null(df) || !nrow(df)) {
+        datatable(data.frame(message = "No entries."), options = list(dom = 't'), rownames = FALSE)
+      } else {
+        datatable(df, selection = "single", editable = TRUE,
+                  options = list(pageLength = 10, dom = 'tip', scrollX = TRUE), rownames = FALSE)
+      }
+    })
+
+    observeEvent(input$log_view_tbl_cell_edit, {
+      info <- input$log_view_tbl_cell_edit
+      df <- log_view_data()
+      if (!is.null(df) && nrow(df) >= info$row) {
+        id <- df[info$row, "id"]
+        col <- colnames(df)[info$col + 1]
+        update_log_entry(id, col, info$value)
+        df[info$row, col] <- info$value
+        log_view_data(df)
+      }
+    })
+
+    observeEvent(input$log_delete_entry, {
+      df <- log_view_data()
+      i <- input$log_view_tbl_rows_selected
+      if (!is.null(df) && nrow(df) && length(i) == 1) {
+        id <- df[i, "id"]
+        delete_log_entry(id)
+        df <- df[-i, , drop = FALSE]
+        log_view_data(df)
+        log_sites(fetch_log_sites())
+        showNotification("Entry deleted.", type = "message")
+      } else {
+        showNotification("Select a row to delete.", type = "warning")
+      }
+    })
 
   onStop(function() {
     if (!is.null(log_db) && DBI::dbIsValid(log_db)) DBI::dbDisconnect(log_db)
