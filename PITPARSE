@@ -20,17 +20,27 @@ library(DBI)
 has_openxlsx <- requireNamespace("openxlsx", quietly = TRUE)
 has_rsqlite  <- requireNamespace("RSQLite", quietly = TRUE)
 
-# Shared log database path
-LOG_DB_PATH <- "\\\\fileserver\\MCFWCO\\AntennaData\\AntennaLog\\antenna_log.sqlite"
+# Shared log database path (override with PITPARSE_LOG_DB_PATH env var)
+LOG_DB_PATH <- Sys.getenv(
+  "PITPARSE_LOG_DB_PATH",
+  "\\\\fileserver\\\\MCFWCO\\\\AntennaData\\\\AntennaLog\\\\antenna_log.sqlite"
+)
 
 open_log_db <- function() {
   if (!has_rsqlite) return(NULL)
-  db_dir <- dirname(LOG_DB_PATH)
+  db_path <- LOG_DB_PATH
+  db_dir <- dirname(db_path)
   if (!dir.exists(db_dir)) {
     ok <- try(dir.create(db_dir, recursive = TRUE), silent = TRUE)
-    if (inherits(ok, "try-error") && !dir.exists(db_dir)) return(NULL)
+    if (inherits(ok, "try-error") && !dir.exists(db_dir)) {
+      db_path <- file.path(tempdir(), "antenna_log.sqlite")
+      db_dir <- dirname(db_path)
+      ok <- try(dir.create(db_dir, recursive = TRUE), silent = TRUE)
+      if (inherits(ok, "try-error") && !dir.exists(db_dir)) return(NULL)
+      LOG_DB_PATH <<- db_path
+    }
   }
-  con <- try(DBI::dbConnect(RSQLite::SQLite(), LOG_DB_PATH), silent = TRUE)
+  con <- try(DBI::dbConnect(RSQLite::SQLite(), db_path), silent = TRUE)
   if (inherits(con, "try-error")) return(NULL)
   DBI::dbExecute(con, "PRAGMA journal_mode=WAL;")
   DBI::dbExecute(con, "PRAGMA synchronous=NORMAL;")
@@ -1086,7 +1096,7 @@ server <- function(input, output, session) {
   output$log_warn_openxlsx <- renderUI({
     msgs <- character()
     if (is.null(log_db) || !DBI::dbIsValid(log_db))
-      msgs <- c(msgs, "Log database not available — logging disabled.")
+      msgs <- c(msgs, "Log database not available — logging disabled. Set 'PITPARSE_LOG_DB_PATH' to configure.")
     if (!has_openxlsx)
       msgs <- c(msgs, "Package 'openxlsx' not installed — Excel export disabled.")
     if (length(msgs)) div(class="mustload", HTML(paste(msgs, collapse="<br/>")))
