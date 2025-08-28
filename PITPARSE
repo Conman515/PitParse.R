@@ -37,6 +37,24 @@ USER_PROFILES <- list(
     junk_path    = "C:/users/chaskell/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists/Test Tags and Pingers.txt",
     antenna_log  = "C:/users/chaskell/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Antenna Log.xlsx",
     initials     = ""
+  ),
+  emeyer = list(
+    download_dir = "C:/users/emeyer/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Non_TNWR_Antenna_Files/Download Files",
+    taglist_dir  = "C:/users/emeyer/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists",
+    compiled_dir = "C:/users/emeyer/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Non_TNWR_Antenna_Files/Compiled Data",
+    vt_path      = "C:/users/emeyer/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists/Virtual Test Tags.txt",
+    junk_path    = "C:/users/emeyer/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists/Test Tags and Pingers.txt",
+    antenna_log  = "C:/users/emeyer/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Antenna Log.xlsx",
+    initials     = ""
+  ),
+  lknitter = list(
+    download_dir = "C:/users/lknitter/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Non_TNWR_Antenna_Files/Download Files",
+    taglist_dir  = "C:/users/lknitter/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists",
+    compiled_dir = "C:/users/lknitter/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Non_TNWR_Antenna_Files/Compiled Data",
+    vt_path      = "C:/users/lknitter/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists/Virtual Test Tags.txt",
+    junk_path    = "C:/users/lknitter/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists/Test Tags and Pingers.txt",
+    antenna_log  = "C:/users/lknitter/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Antenna Log.xlsx",
+    initials     = ""
   )
 )
 
