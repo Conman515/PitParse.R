@@ -14,9 +14,32 @@
 
 library(shiny)
 library(DT)
+library(DBI)
 
-# ========= OPTIONAL EXCEL DEP =========
+# ========= OPTIONAL DEPENDENCIES =========
 has_openxlsx <- requireNamespace("openxlsx", quietly = TRUE)
+has_rsqlite  <- requireNamespace("RSQLite", quietly = TRUE)
+
+# Shared log database path
+LOG_DB_PATH <- "\\\\fileserver\\MCFWCO\\AntennaData\\AntennaLog\\antenna_log.sqlite"
+
+open_log_db <- function() {
+  if (!has_rsqlite) return(NULL)
+  db_dir <- dirname(LOG_DB_PATH)
+  if (!dir.exists(db_dir)) {
+    ok <- try(dir.create(db_dir, recursive = TRUE), silent = TRUE)
+    if (inherits(ok, "try-error") && !dir.exists(db_dir)) return(NULL)
+  }
+  con <- try(DBI::dbConnect(RSQLite::SQLite(), LOG_DB_PATH), silent = TRUE)
+  if (inherits(con, "try-error")) return(NULL)
+  DBI::dbExecute(con, "PRAGMA journal_mode=WAL;")
+  DBI::dbExecute(con, "PRAGMA synchronous=NORMAL;")
+  DBI::dbExecute(con, "PRAGMA busy_timeout=5000;")
+  DBI::dbExecute(con, "CREATE TABLE IF NOT EXISTS antenna_log (id INTEGER PRIMARY KEY, site TEXT, date TEXT, personnel TEXT, downloaded TEXT, ptagis TEXT, status TEXT, comments TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+  con
+}
+
+log_db <- open_log_db()
 
 # ========= USER PROFILES =========
 USER_PROFILES <- list(
@@ -26,7 +49,6 @@ USER_PROFILES <- list(
     compiled_dir = "C:/Users/ccunningham/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Non_TNWR_Antenna_Files/Compiled Data",
     vt_path      = "C:/Users/ccunningham/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists/Virtual Test Tags.txt",
     junk_path    = "C:/Users/ccunningham/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists/Test Tags and Pingers.txt",
-    antenna_log  = "C:/Users/ccunningham/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Antenna Log.xlsx",
     initials     = "CDC"
   ),
   chaskell = list(
@@ -35,7 +57,6 @@ USER_PROFILES <- list(
     compiled_dir = "C:/users/chaskell/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Non_TNWR_Antenna_Files/Compiled Data",
     vt_path      = "C:/users/chaskell/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists/Virtual Test Tags.txt",
     junk_path    = "C:/users/chaskell/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists/Test Tags and Pingers.txt",
-    antenna_log  = "C:/users/chaskell/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Antenna Log.xlsx",
     initials     = ""
   ),
   emeyer = list(
@@ -44,7 +65,6 @@ USER_PROFILES <- list(
     compiled_dir = "C:/users/emeyer/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Non_TNWR_Antenna_Files/Compiled Data",
     vt_path      = "C:/users/emeyer/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists/Virtual Test Tags.txt",
     junk_path    = "C:/users/emeyer/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists/Test Tags and Pingers.txt",
-    antenna_log  = "C:/users/emeyer/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Antenna Log.xlsx",
     initials     = ""
   ),
   lknitter = list(
@@ -53,7 +73,6 @@ USER_PROFILES <- list(
     compiled_dir = "C:/users/lknitter/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Non_TNWR_Antenna_Files/Compiled Data",
     vt_path      = "C:/users/lknitter/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists/Virtual Test Tags.txt",
     junk_path    = "C:/users/lknitter/DOI/MCFWCO Yakima Sub-Office - Documents/General/TagLists/Test Tags and Pingers.txt",
-    antenna_log  = "C:/users/lknitter/DOI/MCFWCO Yakima Sub-Office - Documents/General/Antenna Data/Antenna Log.xlsx",
     initials     = ""
   )
 )
@@ -406,7 +425,11 @@ ui <- fluidPage(
                                  column(3, actionButton("log_update_btn", "Update pending row", class="btn-secondary", width="100%")),
                                  column(3, actionButton("log_append_btn", "Append selected", class="btn-primary", width="100%")),
                                  column(3, actionButton("log_append_all_btn", "Append ALL pending", class="btn-warning", width="100%")),
-                                 column(3, actionButton("log_refresh_btn", "Refresh sheet meta", class="btn-secondary", width="100%"))
+                                column(3, actionButton("log_refresh_btn", "Refresh controls", class="btn-secondary", width="100%"))
+                               ),
+                               fluidRow(
+                                 column(3, downloadButton("log_export_xlsx", "Export to Excel", class="btn-secondary", width="100%")),
+                                 column(3, downloadButton("log_export_csv", "Export to CSV", class="btn-secondary", width="100%"))
                                ),
                                tags$br(),
                                verbatimTextOutput("log_result")
@@ -421,95 +444,23 @@ ui <- fluidPage(
 
 # ========= SERVER =========
 server <- function(input, output, session) {
-  # ---------- Excel helpers tuned to your actual workbook ----------
-  # Ensure header exists; rely on column position rather than name matching
-  ensure_header <- function(wb, sheet, headers_now, need_ptagis) {
-    if (!length(headers_now)) {
-      headers_now <- c("Date", "Personnel", "Downloaded? (Y/N)",
-                       if (need_ptagis) "Uploaded to PTAGIS?", "Status/Needs", "Comments")
-      openxlsx::writeData(
-        wb, sheet = sheet,
-        x = as.data.frame(setNames(vector("list", length(headers_now)), headers_now)),
-        startCol = 1, startRow = 1, withFilter = FALSE
-      )
-    } else if (need_ptagis && length(headers_now) == 5) {
-      headers_now <- c(headers_now[1:3], "Uploaded to PTAGIS?", headers_now[4:5])
-      openxlsx::writeData(
-        wb, sheet = sheet,
-        x = as.data.frame(setNames(vector("list", length(headers_now)), headers_now)),
-        startCol = 1, startRow = 1, withFilter = FALSE
-      )
+  # ---------- SQLite logging helpers ----------
+  append_log_entry <- function(site, Date, Personnel, Downloaded, PTagis, Status, Comments) {
+    if (is.null(log_db) || !DBI::dbIsValid(log_db))
+      return(list(ok=FALSE, id=NA_integer_, site=site, msg="Database not available"))
+    for (attempt in 1:3) {
+      res <- tryCatch({
+        DBI::dbWithTransaction(log_db, {
+          DBI::dbExecute(log_db,
+            "INSERT INTO antenna_log (site,date,personnel,downloaded,ptagis,status,comments) VALUES (?,?,?,?,?,?,?)",
+            params=list(site, as.character(as.Date(Date)), Personnel, Downloaded, PTagis, Status, Comments))
+          DBI::dbGetQuery(log_db, "SELECT last_insert_rowid() AS id")$id
+        })
+      }, error=function(e) e)
+      if (!inherits(res, "error")) return(list(ok=TRUE, id=res, site=site, msg="OK"))
+      Sys.sleep(0.2 * attempt)
     }
-    headers_now
-  }
-  # Safe open / sheet pick (case-insensitive match to reuse existing site tab)
-  open_wb_and_pick_sheet <- function(path, site_code) {
-    wb <- if (file.exists(path)) try(openxlsx::loadWorkbook(path), silent=TRUE) else openxlsx::createWorkbook()
-    if (inherits(wb, "try-error")) return(list(error="Could not open workbook", wb=NULL, sheet=NULL))
-    sheets_now <- openxlsx::sheets(wb)
-    sheet <- site_code
-    if (length(sheets_now)) {
-      # case-insensitive exact match first
-      ci_match <- which(tolower(sheets_now) == tolower(site_code))
-      if (length(ci_match)) sheet <- sheets_now[ci_match[1]]
-    }
-    if (!(sheet %in% openxlsx::sheets(wb))) openxlsx::addWorksheet(wb, sheet)
-    list(error=NULL, wb=wb, sheet=sheet)
-  }
-  # Write one row given form values; returns list(ok, row_index, sheet, msg)
-  append_one_row <- function(path, site_code, Date, Personnel, Downloaded, PTagis, Status, Comments, force_add_ptagis=FALSE) {
-    pick <- open_wb_and_pick_sheet(path, site_code)
-    if (!is.null(pick$error)) return(list(ok=FALSE, row_index=NA_integer_, sheet=site_code, msg=pick$error))
-    wb <- pick$wb; sheet <- pick$sheet
-    df0 <- try(openxlsx::readWorkbook(wb, sheet = sheet, check.names = FALSE), silent=TRUE)
-    if (inherits(df0, "try-error") || !is.data.frame(df0)) df0 <- data.frame()
-    headers_now <- if (ncol(df0)) names(df0) else character(0)
-
-    # Decide if PTAGIS column should be present based on count or user request
-    need_ptagis <- (ncol(df0) >= 6) || isTRUE(force_add_ptagis) ||
-                   (isTRUE(!is.na(PTagis)) && nzchar(PTagis))
-
-    # Ensure header exists / add PTAGIS column by position
-    headers_now <- ensure_header(wb, sheet, headers_now, need_ptagis)
-
-    # Re-read after any header normalization
-    df0 <- try(openxlsx::readWorkbook(wb, sheet = sheet, check.names = FALSE), silent=TRUE)
-    if (inherits(df0, "try-error") || !is.data.frame(df0)) df0 <- data.frame()
-    if (!ncol(df0)) {
-      df0 <- as.data.frame(setNames(vector("list", length(headers_now)), headers_now))
-      df0 <- df0[0, , drop = FALSE]
-    }
-
-    # Build a new row aligned purely by column index so the appender
-    # is agnostic to existing header names (only their order matters).
-    new_row <- vector("list", length(headers_now))
-    new_row[[1]] <- format(as.Date(Date), "%m/%d/%y")
-    new_row[[2]] <- Personnel
-    new_row[[3]] <- Downloaded
-    idx <- 3
-    if (need_ptagis) {
-      idx <- idx + 1
-      new_row[[idx]] <- PTagis %||% "N"
-    }
-    new_row[[idx + 1]] <- Status
-    new_row[[idx + 2]] <- Comments
-
-    # Ensure each column has a value so as.data.frame() doesn't error on NULL
-    new_row <- lapply(new_row, function(x) if (is.null(x) || length(x) == 0) NA_character_ else x)
-    append_df <- as.data.frame(new_row, stringsAsFactors = FALSE)
-    colnames(append_df) <- headers_now
-    row_index <- nrow(df0) + 2  # row 1 header, so first data row = 2
-    df_all <- rbind(df0, append_df)
-    # Rewrite entire sheet to avoid append failures on certain workbooks
-    openxlsx::writeData(wb, sheet = sheet, x = df_all, startRow = 1, startCol = 1,
-                        colNames = TRUE, withFilter = FALSE)
-
-    old_mtime <- if (file.exists(path)) file.info(path)$mtime else NA
-    ok <- try(openxlsx::saveWorkbook(wb, file = path, overwrite = TRUE), silent = TRUE)
-    new_mtime <- if (file.exists(path)) file.info(path)$mtime else NA
-    if (inherits(ok, "try-error") || is.na(new_mtime) || (!is.na(old_mtime) && new_mtime <= old_mtime))
-      return(list(ok=FALSE, row_index=NA_integer_, sheet=sheet, msg="Save failed (file open/locked or permission denied)"))
-    list(ok=TRUE, row_index=row_index, sheet=sheet, msg="OK")
+    list(ok=FALSE, id=NA_integer_, site=site, msg="Database busy or locked")
   }
   
   # ---------- Active dataset presence flag ----------
@@ -1110,7 +1061,7 @@ server <- function(input, output, session) {
       sprintf("Compiled dir : %s", p$compiled_dir),
       sprintf("VT file      : %s", p$vt_path),
       sprintf("Pingers file : %s", p$junk_path),
-      sprintf("Antenna log  : %s", p$antenna_log %||% "(unset)"),
+      sprintf("Antenna log DB  : %s", LOG_DB_PATH),
       sprintf("Taglist sel  : %s", show_tl),
       sprintf("Compiled sel : %s", show_cp),
       sep="\n"
@@ -1133,34 +1084,26 @@ server <- function(input, output, session) {
   
   # ============================== LOG TAB ==============================
   output$log_warn_openxlsx <- renderUI({
-    if (!has_openxlsx) div(class="mustload", "Package 'openxlsx' not installed — Antenna Log writing disabled.")
+    msgs <- character()
+    if (is.null(log_db) || !DBI::dbIsValid(log_db))
+      msgs <- c(msgs, "Log database not available — logging disabled.")
+    if (!has_openxlsx)
+      msgs <- c(msgs, "Package 'openxlsx' not installed — Excel export disabled.")
+    if (length(msgs)) div(class="mustload", HTML(paste(msgs, collapse="<br/>")))
   })
-  
+
   # table of pending items
   output$log_queue_tbl <- renderDT({
     dq <- rv$log_queue
     if (is.null(dq) || !nrow(dq)) return(datatable(data.frame(message="No pending entries. Upload files to populate."), options=list(dom='t'), rownames=FALSE))
     datatable(dq, selection = "single", options=list(pageLength=6, dom='tip', order=list(list(0,'asc')), scrollX=TRUE), rownames=FALSE)
   })
-  
-  # Refresh PTAGIS control visibility (reads the chosen site's sheet)
+
+  # Refresh PTAGIS control visibility (simple since DB always has column)
   refresh_ptagis_ui <- function(sel_site, sel_value="N") {
-    p <- paths(); log_path <- p$antenna_log %||% ""
-    has_pt <- FALSE
-    if (has_openxlsx && nzchar(log_path) && file.exists(log_path)) {
-      pick <- open_wb_and_pick_sheet(log_path, sel_site)
-      if (is.null(pick$error)) {
-        df0 <- try(openxlsx::readWorkbook(pick$wb, sheet = pick$sheet, check.names = FALSE), silent=TRUE)
-        if (!inherits(df0, "try-error") && is.data.frame(df0)) {
-          has_pt <- ncol(df0) >= 6
-        }
-      }
-    }
-    rv$log_sheet_has_ptagis <- has_pt
+    rv$log_sheet_has_ptagis <- TRUE
     output$log_ptagis_ui <- renderUI({
-      if (isTRUE(rv$log_sheet_has_ptagis)) selectInput("log_ptagis", "Uploaded to PTAGIS?", choices=c("Y","N"), selected=sel_value)
-      else selectInput("log_ptagis", "Uploaded to PTAGIS?", choices=c("N","Y"), selected=sel_value,
-                       width="100%") # keep visible; if set to Y we'll add the column
+      selectInput("log_ptagis", "Uploaded to PTAGIS?", choices=c("Y","N"), selected=sel_value, width="100%")
     })
   }
   
@@ -1199,15 +1142,13 @@ server <- function(input, output, session) {
 
   # Append ONE
   observeEvent(input$log_append_btn, {
-    if (!has_openxlsx) { showNotification("Install 'openxlsx' to write the Antenna Log.", type="error"); return() }
     dq <- rv$log_queue
     if (is.null(dq) || !nrow(dq)) { showNotification("No pending entry selected.", type="warning"); return() }
+    if (is.null(log_db) || !DBI::dbIsValid(log_db)) { showNotification("Log database not available.", type="error"); return() }
     i <- input$log_queue_tbl_rows_selected
     if (length(i)!=1) { showNotification("Select one pending row first.", type="warning"); return() }
     row <- dq[i, , drop=FALSE]
-    p <- paths(); log_path <- p$antenna_log %||% ""
-    if (!nzchar(log_path)) { showNotification("Antenna log path not set for this profile.", type="error"); return() }
-    
+
     # Gather form values
     Date <- as.Date(input$log_date %||% Sys.Date())
     Personnel <- trimws(input$log_personnel %||% "")
@@ -1226,14 +1167,13 @@ server <- function(input, output, session) {
     dq$Comments[i]   <- Comments
     rv$log_queue <- dq
 
-    res <- append_one_row(log_path, Site, Date, Personnel, Downloaded, PTagis, Status, Comments,
-                          force_add_ptagis = (toupper(PTagis)=="Y"))
+    res <- append_log_entry(Site, Date, Personnel, Downloaded, PTagis, Status, Comments)
     if (!isTRUE(res$ok)) {
       output$log_result <- renderText(sprintf("Append failed — %s", res$msg))
       showNotification("Write failed.", type="error")
       return()
     }
-    
+
     # Success: remove from queue + tell the user exactly where it went
     rv$log_queue <- dq[-i, , drop=FALSE]
     output$log_queue_tbl <- renderDT({
@@ -1241,20 +1181,18 @@ server <- function(input, output, session) {
       if (is.null(dq2) || !nrow(dq2)) return(datatable(data.frame(message="All pending entries logged."), options=list(dom='t'), rownames=FALSE))
       datatable(dq2, selection = "single", options=list(pageLength=6, dom='tip', scrollX=TRUE), rownames=FALSE)
     })
-    output$log_result <- renderText(sprintf("Appended to '%s'  |  Sheet: %s  |  Row: %s\nDate: %s  Personnel: %s  Downloaded?: %s  Uploaded to PTAGIS?: %s  Status: %s\nComments: %s",
-                                            log_path, res$sheet, res$row_index,
+    output$log_result <- renderText(sprintf("Appended to '%s'  |  Site: %s  |  ID: %s\nDate: %s  Personnel: %s  Downloaded?: %s  Uploaded to PTAGIS?: %s  Status: %s\nComments: %s",
+                                            LOG_DB_PATH, res$site, res$id,
                                             format(Date, "%m/%d/%y"), Personnel, Downloaded, ifelse(toupper(PTagis)=="Y","Y","N"), Status, Comments))
-    showNotification(sprintf("Antenna Log updated (sheet %s, row %s).", res$sheet, res$row_index), type="message")
+    showNotification(sprintf("Antenna Log updated (ID %s).", res$id), type="message")
   })
   
   # Append ALL
   observeEvent(input$log_append_all_btn, {
-    if (!has_openxlsx) { showNotification("Install 'openxlsx' to write the Antenna Log.", type="error"); return() }
     dq <- rv$log_queue
     if (is.null(dq) || !nrow(dq)) { showNotification("No pending entries.", type="warning"); return() }
-    p <- paths(); log_path <- p$antenna_log %||% ""
-    if (!nzchar(log_path)) { showNotification("Antenna log path not set for this profile.", type="error"); return() }
-    
+    if (is.null(log_db) || !DBI::dbIsValid(log_db)) { showNotification("Log database not available.", type="error"); return() }
+
     if (any(!nzchar(trimws(dq$Personnel)))) { showNotification("Personnel missing for one or more rows.", type="warning"); return() }
 
     results <- lapply(seq_len(nrow(dq)), function(i){
@@ -1265,14 +1203,13 @@ server <- function(input, output, session) {
       PTagis     <- as.character(dq$PTAGIS[i] %||% "N")
       Status     <- trimws(dq$Status[i] %||% "Operational")
       Comments   <- as.character(dq$Comments[i] %||% "")
-      append_one_row(log_path, Site, Date, Personnel, Downloaded, PTagis, Status, Comments,
-                     force_add_ptagis = (toupper(PTagis)=="Y"))
+      append_log_entry(Site, Date, Personnel, Downloaded, PTagis, Status, Comments)
     })
     ok_ct <- sum(vapply(results, function(r) isTRUE(r$ok), logical(1)))
     rv$log_queue <- dq[0, , drop=FALSE]
     output$log_queue_tbl <- renderDT(datatable(data.frame(message=sprintf("Appended %d row(s).", ok_ct)), options=list(dom='t'), rownames=FALSE))
     output$log_result <- renderText(paste0(vapply(results, function(r){
-      if (isTRUE(r$ok)) sprintf("OK -> Sheet: %s  Row: %s", r$sheet, r$row_index) else sprintf("FAIL -> %s", r$msg)
+      if (isTRUE(r$ok)) sprintf("OK -> Site: %s  ID: %s", r$site, r$id) else sprintf("FAIL -> %s", r$msg)
     }, character(1)), collapse="\n"))
     showNotification(sprintf("Antenna Log updated (%d row(s)).", ok_ct), type="message")
   })
@@ -1282,7 +1219,37 @@ server <- function(input, output, session) {
     if (!length(i)) { showNotification("Select a pending row first.", type="warning"); return() }
     dq <- rv$log_queue; if (is.null(dq) || !nrow(dq)) return()
     refresh_ptagis_ui(as.character(dq$Site[i]), dq$PTAGIS[i] %||% "N")
-    showNotification("Refreshed sheet metadata.", type="message")
+    showNotification("Refreshed controls.", type="message")
+  })
+
+  output$log_export_csv <- downloadHandler(
+    filename = function() sprintf("antenna_log_%s.csv", Sys.Date()),
+    content = function(file) {
+      if (is.null(log_db) || !DBI::dbIsValid(log_db)) stop("Database not available")
+      df <- DBI::dbGetQuery(log_db, "SELECT * FROM antenna_log ORDER BY date")
+      utils::write.csv(df, file, row.names = FALSE)
+    }
+  )
+
+  output$log_export_xlsx <- downloadHandler(
+    filename = function() sprintf("antenna_log_%s.xlsx", Sys.Date()),
+    content = function(file) {
+      if (!has_openxlsx) stop("openxlsx not installed")
+      if (is.null(log_db) || !DBI::dbIsValid(log_db)) stop("Database not available")
+      df <- DBI::dbGetQuery(log_db, "SELECT * FROM antenna_log ORDER BY date")
+      wb <- openxlsx::createWorkbook()
+      sp <- split(df, df$site)
+      if (length(sp) == 0) sp <- list(Log = df)
+      for (nm in names(sp)) {
+        openxlsx::addWorksheet(wb, nm)
+        openxlsx::writeData(wb, nm, sp[[nm]], withFilter = FALSE)
+      }
+      openxlsx::saveWorkbook(wb, file, overwrite = TRUE)
+    }
+  )
+
+  onStop(function() {
+    if (!is.null(log_db) && DBI::dbIsValid(log_db)) DBI::dbDisconnect(log_db)
   })
 }
 
