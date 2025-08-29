@@ -992,7 +992,7 @@ server <- function(input, output, session) {
     if (n_ok > 0) showNotification(sprintf("Saved %d file(s) to: %s", n_ok, target_dir), type="message", duration=6)
     if (n_no > 0) showNotification(sprintf("Skipped/failed: %d file(s). See details below.", n_no), type="warning", duration=8)
     output$upload_result_ui <- renderUI({ tags$details(tags$summary("Upload details"), tags$pre(paste(msgs, collapse="\n"))) })
-    
+
     if (n_ok > 0) {
       alarm_flag <- vapply(seq_along(names_in), function(i) {
         item <- rv$review_data[[ names_in[i] ]]
@@ -1018,6 +1018,12 @@ server <- function(input, output, session) {
       updateTextAreaInput(session, "log_comments", value = "")
       updateTabsetPanel(session, "tabs", selected="Log")
     }
+
+    rv$review_data   <- NULL
+    rv$review_src    <- NULL
+    rv$review_names  <- NULL
+    rv$review_target <- NULL
+    rv$review_overwrite <- FALSE
   })
   
   # ========= Populate selectors when active changes =========
