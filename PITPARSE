@@ -19,6 +19,7 @@ library(DBI)
 # ========= OPTIONAL DEPENDENCIES =========
 has_openxlsx <- requireNamespace("openxlsx", quietly = TRUE)
 has_rsqlite  <- requireNamespace("RSQLite", quietly = TRUE)
+has_digest   <- requireNamespace("digest", quietly = TRUE)
 
 # Shared log database path (override with PITPARSE_LOG_DB_PATH env var)
 user_name <- Sys.getenv("USERNAME")
@@ -587,7 +588,29 @@ server <- function(input, output, session) {
     selectInput("compiled_pick", "Compiled RDS", choices=choices, selected=df$path[1], width="100%")
   })
   newest_compiled_path <- reactive({ df <- list_compiled(); if (!nrow(df)) "" else df$path[1] })
-  
+
+  # Persisted fingerprint of seen files (by basename; optionally by size/hash)
+  seen_cache_path <- reactive({
+    p <- paths(); if (is.null(p)) return("")
+    file.path(p$compiled_dir, "seen_files.rds")
+  })
+
+  seen_files_start <- reactive({
+    sp <- seen_cache_path(); if (!nzchar(sp)) return(character(0))
+    tryCatch(readRDS(sp), error = function(e) character(0))
+  })
+
+  # Optional robust signature combining basename + size (and md5 if digest is installed)
+  file_sig <- function(path) {
+    info <- tryCatch(file.info(path), error = function(e) NULL)
+    base <- tolower(basename(path))
+    if (is.null(info)) return(base)
+    sig <- paste0(base, "::", info$size %||% 0)
+    # Uncomment to make it ironclad (slower): include md5 content hash
+    # if (has_digest) sig <- paste0(sig, "::", digest::digest(path, file = TRUE, algo = "md5"))
+    sig
+  }
+
   # ----- Core state
   active_df     <- reactiveVal(NULL)
   scanned_files <- reactiveVal(character(0))
@@ -644,11 +667,29 @@ server <- function(input, output, session) {
     
     cur <- active_df()
     already <- character(0)
+
+    # Pull baselines from the active dataset (if present)
     if (!is.null(cur)) {
       fv <- get_file_vec(cur)
-      already <- unique(tolower(fv[!is.na(fv) & nzchar(fv)]))
+      if (length(fv)) {
+        already <- unique(tolower(fv[!is.na(fv) & nzchar(fv)]))
+      }
     }
-    files_new <- files_all[!(tolower(basename(files_all)) %in% already)]
+
+    # Union with persisted fingerprint (seen_files.rds)
+    seen0 <- seen_files_start()
+    if (length(seen0)) {
+      already <- unique(c(already, seen0))
+    }
+
+    # Compute new files. Default uses basenames; switch to file_sig() if you want stricter match.
+    files_basenames <- tolower(basename(files_all))
+    files_new <- files_all[!(files_basenames %in% already)]
+
+    # Optional: strict signature match (uncomment to prefer size/hash-based signatures)
+    # sig_all <- vapply(files_all, file_sig, character(1))
+    # files_new <- files_all[!(sig_all %in% already)]
+
     if (!length(files_new)) { new_files_ct(0); showNotification("No new files found. Dataset unchanged.", type="message"); return() }
 
     withProgress(message=paste0("Parsing ", length(files_new), " new file(s)…"), value=0, {
@@ -708,6 +749,26 @@ server <- function(input, output, session) {
     }
     
     active_df(cur <- ensure_datetime(cur))
+
+    # Persist updated fingerprint for future sessions
+    if (nrow(cur)) {
+      # By default, persist basenames present in the active dataset.
+      cur_seen <- unique(tolower(basename(get_file_vec(cur))))
+
+      # If you want to mark literally everything scanned this run as "seen", union with all basenames:
+      # cur_seen <- unique(c(cur_seen, tolower(basename(files_all))))
+
+      # Optional: use robust signatures instead of basenames
+      # cur_seen <- unique(vapply(files_all, file_sig, character(1)))
+
+      sp <- seen_cache_path()
+      if (nzchar(sp)) {
+        old <- seen_files_start()
+        new <- unique(c(old, cur_seen))
+        try(saveRDS(new, sp), silent = TRUE)
+      }
+    }
+
     new_files_ct(length(files_new))
     showNotification(paste0("Appended ", length(files_new), " new file(s). Active rows: ", format(nrow(cur), big.mark=","), "."), type="message")
   })
@@ -1159,7 +1220,9 @@ server <- function(input, output, session) {
       site_head          = if (!is.null(df)) head(na.omit(unique(get_site_vec(df))), 10) else character(0),
       file_head          = if (!is.null(df)) head(na.omit(unique(get_file_vec(df))), 10) else character(0),
       has_tag_cols       = if (!is.null(df)) names(df)[tolower(names(df)) %in% c("tagid","pit.tag","tag")] else character(0),
-      years_available    = if (!is.null(df)) sort(na.omit(unique(df$detYear)), decreasing=TRUE) else integer(0)
+      years_available    = if (!is.null(df)) sort(na.omit(unique(df$detYear)), decreasing=TRUE) else integer(0),
+      seen_cache_file    = seen_cache_path(),
+      seen_cache_count   = length(seen_files_start())
     )
   })
   
