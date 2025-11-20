@@ -794,20 +794,32 @@ server <- function(input, output, session) {
       uniq_ids <- unique(dets$tagID[!is.na(dets$tagID)])
       if (length(blocklist)) uniq_ids <- setdiff(uniq_ids, blocklist)
       uniq_tbl <- if (length(uniq_ids)) data.frame(TagID = uniq_ids, stringsAsFactors = FALSE) else data.frame(TagID=character(0))
-      
+
+      det_subset <- dets[!is.na(dets$tagID) & !is.na(dets$dateTime), c("tagID","dateTime"), drop=FALSE]
+      det_time <- if (nrow(det_subset)) aggregate(list(Detected=det_subset$dateTime), by=list(TagID=det_subset$tagID), FUN=min) else data.frame(TagID=character(0), Detected=as.POSIXct(character(0)))
+      if (nrow(det_time)) {
+        tz <- attr(det_subset$dateTime, "tzone") %||% ""
+        det_time$Detected <- as.POSIXct(det_time$Detected, origin="1970-01-01", tz=tz)
+      }
+
       if (!is.null(tag_meta) && nrow(uniq_tbl)) {
         keep_cols <- c('PIT.Tag','Event.Date','Stock','Acoustic.Tag','Release.Site','Event.Site','Release.Site.Name','Event.Site.Name')
         keep_cols <- keep_cols[keep_cols %in% names(tag_meta)]
         bt_sub <- unique(tag_meta[, keep_cols, drop=FALSE]); names(bt_sub)[names(bt_sub)=="PIT.Tag"] <- "TagID"
         uniq_tbl <- merge(uniq_tbl, bt_sub, by="TagID", all.x=TRUE)
       }
-      
+
       if (nrow(uniq_tbl)) {
+        uniq_tbl <- merge(uniq_tbl, det_time, by="TagID", all.x=TRUE, sort=FALSE)
+        uniq_tbl$Detected <- ifelse(is.na(uniq_tbl$Detected), "", format(uniq_tbl$Detected, "%m/%d/%Y %H:%M:%OS3"))
         uniq_tbl$PTAGIS <- vapply(seq_len(nrow(uniq_tbl)), function(r){
           if (missing_taglist_meta(uniq_tbl[r, , drop=FALSE])) ptagis_link_for(uniq_tbl$TagID[r]) else ""
         }, character(1))
+      } else {
+        uniq_tbl$Detected <- character(0)
       }
-      
+
+      uniq_tbl <- uniq_tbl[, c("TagID","Detected", setdiff(names(uniq_tbl), c("TagID","Detected"))), drop=FALSE]
       uniq_tbl <- uniq_tbl[order(uniq_tbl$TagID), , drop=FALSE]
       uniq_count <- nrow(uniq_tbl)
       
