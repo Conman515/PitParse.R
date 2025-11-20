@@ -643,6 +643,24 @@ server <- function(input, output, session) {
 
   log_sites <- reactiveVal(fetch_log_sites())
   log_view_data <- reactiveVal(data.frame())
+
+  drop_blocklisted_tags <- function(df, blocklist=character(0)) {
+    if (!nrow(df) || !length(blocklist)) return(df)
+    tag_col <- if ("tagID" %in% names(df)) "tagID" else if ("TagID" %in% names(df)) "TagID" else if ("PIT.Tag" %in% names(df)) "PIT.Tag" else NULL
+    if (is.null(tag_col)) return(df)
+    keep <- is.na(df[[tag_col]]) | !(as.character(df[[tag_col]]) %in% blocklist)
+    df[keep, , drop=FALSE]
+  }
+
+  dedup_by_tag <- function(df) {
+    if (!nrow(df)) return(df)
+    tag_col <- if ("tagID" %in% names(df)) "tagID" else if ("TagID" %in% names(df)) "TagID" else if ("PIT.Tag" %in% names(df)) "PIT.Tag" else NULL
+    if (is.null(tag_col)) return(df)
+    df <- ensure_datetime(df)
+    df <- df[order(df$dateTime, decreasing=FALSE), , drop=FALSE]
+    dedup_idx <- !duplicated(as.character(df[[tag_col]]))
+    df[dedup_idx, , drop=FALSE]
+  }
   
   # ---------- Active dataset presence flag ----------
   output$must_load_banner <- renderUI({
@@ -1166,6 +1184,8 @@ server <- function(input, output, session) {
   output$tbl_site_dets <- renderDT({
     if (is.null(active_df()) || !nrow(active_df())) return(datatable(data.frame(), rownames=FALSE))
     df <- site_filtered()
+    df <- drop_blocklisted_tags(df, bl_vec())
+    df <- dedup_by_tag(df)
     if (!nrow(df)) return(datatable(data.frame(), rownames=FALSE))
     if (!"site" %in% names(df)) df$site <- get_site_vec(df)
     if (!"file" %in% names(df)) df$file <- get_file_vec(df)
@@ -1199,6 +1219,8 @@ server <- function(input, output, session) {
   output$tbl_files_dets <- renderDT({
     if (is.null(active_df()) || !nrow(active_df())) return(datatable(data.frame(), rownames=FALSE))
     df <- files_filtered()
+    df <- drop_blocklisted_tags(df, bl_vec())
+    df <- dedup_by_tag(df)
     if (!nrow(df)) return(datatable(data.frame(), rownames=FALSE))
     tag_col <- if ("tagID" %in% names(df)) "tagID" else if ("TagID" %in% names(df)) "TagID" else if ("PIT.Tag" %in% names(df)) "PIT.Tag" else NULL
     if (!is.null(tag_col)) df$TagID <- sprintf('<a href="#" class="go-fish" data-tag="%s">%s</a>', as.character(df[[tag_col]]), as.character(df[[tag_col]]))
