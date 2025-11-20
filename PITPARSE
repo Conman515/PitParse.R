@@ -141,7 +141,7 @@ derive_site_from_name <- function(path_or_name) {
   out <- ifelse(m > 0, regmatches(stem, m), "")
   toupper(out)
 }
-is_master_site <- function(site) site %in% c("CLE","KOCH","TAN","KCH")
+is_master_site <- function(site) site %in% c("CLE","KOCH","TAN","KCH","LATMC")
 
 best_time_parse <- function(x) {
   if (is.null(x)) return(as.POSIXct(character(0), tz="America/Los_Angeles"))
@@ -327,7 +327,7 @@ align_compiled_columns <- function(df) {
   df
 }
 
-compile_from_downloads <- function(download_dir, prev_df=NULL, mc_sites=c("CLE","KOCH","TAN","KCH")) {
+compile_from_downloads <- function(download_dir, prev_df=NULL, mc_sites=c("CLE","KOCH","TAN","KCH","LATMC"), blocklist=character(0)) {
   stopifnot(dir.exists(download_dir))
 
   prev_df <- prev_df %||% data.frame()
@@ -344,84 +344,89 @@ compile_from_downloads <- function(download_dir, prev_df=NULL, mc_sites=c("CLE",
 
   new_files <- all_files[!all_files %in% prev_files]
 
-  parts <- list(); idx <- 1L
-  for (i in seq_along(new_files)) {
-    f_name  <- new_files[i]
-    f_path  <- file.path(download_dir, f_name)
-    f_lines <- safe_read_lines(f_path)
-    tag_lines <- f_lines[nchar(f_lines) >= 5 & substr(f_lines, 2, 5) == "TAG:"]
-    if (!length(tag_lines)) next
+    parts <- list(); idx <- 1L
+    for (i in seq_along(new_files)) {
+      f_name  <- new_files[i]
+      f_path  <- file.path(download_dir, f_name)
+      f_lines <- safe_read_lines(f_path)
+      tag_lines <- f_lines[nchar(f_lines) >= 5 & substr(f_lines, 2, 5) == "TAG:"]
+      if (!length(tag_lines)) next
 
-    site <- strsplit(f_name, "_")[[1]][1]
-    split_lines <- strsplit(tag_lines, " ")
-    dat_i <- data.frame(site = rep(site, length(split_lines)),
-                        dateTime = NA_character_,
-                        tagID = NA_character_,
-                        fileName = f_name,
-                        stringsAsFactors = FALSE)
+      site <- strsplit(f_name, "_")[[1]][1]
+      split_lines <- strsplit(tag_lines, " ")
+      dat_i <- data.frame(site = rep(site, length(split_lines)),
+                          dateTime = NA_character_,
+                          tagID = NA_character_,
+                          node = NA_character_,
+                          fileName = f_name,
+                          stringsAsFactors = FALSE)
 
-    if (site %in% mc_sites) {
-      for (j in seq_along(split_lines)) {
-        pj <- split_lines[[j]]
-        if (length(pj) >= 6) {
-          dat_i$site[j] <- paste0(site, "_", pj[3])
-          dat_i$dateTime[j] <- paste(pj[4], pj[5])
-          dat_i$tagID[j] <- pj[6]
+      if (site %in% mc_sites) {
+        for (j in seq_along(split_lines)) {
+          pj <- split_lines[[j]]
+          if (length(pj) >= 6) {
+            dat_i$site[j] <- paste0(site, "_", pj[3])
+            dat_i$node[j] <- pj[3]
+            dat_i$dateTime[j] <- paste(pj[4], pj[5])
+            dat_i$tagID[j] <- pj[6]
+          }
+        }
+      } else {
+        for (j in seq_along(split_lines)) {
+          pj <- split_lines[[j]]
+          if (length(pj) >= 5) {
+            dat_i$dateTime[j] <- paste(pj[3], pj[4])
+            dat_i$tagID[j] <- pj[5]
+          }
         }
       }
-    } else {
-      for (j in seq_along(split_lines)) {
-        pj <- split_lines[[j]]
-        if (length(pj) >= 5) {
-          dat_i$dateTime[j] <- paste(pj[3], pj[4])
-          dat_i$tagID[j] <- pj[5]
-        }
-      }
+
+      parts[[idx]] <- dat_i
+      idx <- idx + 1L
     }
 
-    parts[[idx]] <- dat_i
-    idx <- idx + 1L
-  }
+    if (!length(parts)) {
+      new_df <- align_compiled_columns(prev_df)
+      return(list(all_new = new_df[0, , drop=FALSE],
+                  combined = prev_df,
+                  new_files = character(0)))
+    }
 
-  if (!length(parts)) {
-    new_df <- align_compiled_columns(prev_df)
-    return(list(all_new = new_df[0, , drop=FALSE],
-                combined = prev_df,
-                new_files = character(0)))
-  }
-
-  all_raw <- do.call(rbind, parts)
-  all_new <- all_raw[!duplicated(all_raw[, c("site", "dateTime", "tagID")]), , drop=FALSE]
-  all_new$dateTime <- as.POSIXct(all_new$dateTime, "%m/%d/%Y %H:%M:%OS", tz = "America/Los_Angeles")
+    all_raw <- do.call(rbind, parts)
+    all_new <- all_raw[!duplicated(all_raw[, c("site", "dateTime", "tagID")]), , drop=FALSE]
+    all_new$dateTime <- as.POSIXct(all_new$dateTime, "%m/%d/%Y %H:%M:%OS", tz = "America/Los_Angeles")
 
   cutoff <- as.POSIXct(as.Date(Sys.time()) - (365 * 5), tz = "America/Los_Angeles")
   all_new <- all_new[all_new$dateTime > cutoff, , drop=FALSE]
   all_new <- all_new[!is.na(all_new$dateTime), , drop=FALSE]
 
-  all_new <- data.frame(
-    Type = "Biomark",
-    dateTime = all_new$dateTime,
-    tagID = as.character(all_new$tagID),
-    duration = NA,
-    class = NA,
-    site = all_new$site,
-    fileName = all_new$fileName,
-    file = all_new$fileName,
-    ukn = NA,
-    elapsed = NA,
-    strL = NA,
-    detYear = as.numeric(format(all_new$dateTime, "%Y")),
-    detMonth = as.numeric(format(all_new$dateTime, "%m")),
-    detDay = as.numeric(format(all_new$dateTime, "%j")),
-    ant = NA,
-    node = NA,
-    stringsAsFactors = FALSE
-  )
+    all_new <- data.frame(
+      Type = "Biomark",
+      dateTime = all_new$dateTime,
+      tagID = as.character(all_new$tagID),
+      duration = NA,
+      class = NA,
+      site = all_new$site,
+      fileName = all_new$fileName,
+      file = all_new$fileName,
+      ukn = NA,
+      elapsed = NA,
+      strL = NA,
+      detYear = as.numeric(format(all_new$dateTime, "%Y")),
+      detMonth = as.numeric(format(all_new$dateTime, "%m")),
+      detDay = as.numeric(format(all_new$dateTime, "%j")),
+      ant = all_new$node,
+      node = all_new$node,
+      stringsAsFactors = FALSE
+    )
+
+    all_new <- drop_blocklisted_tags(all_new, blocklist)
 
   all_new <- align_compiled_columns(all_new)
   prev_df <- align_compiled_columns(prev_df)
 
-  combined <- rbind(prev_df, all_new)
+    combined <- rbind(prev_df, all_new)
+    combined <- drop_blocklisted_tags(combined, blocklist)
   dup_key <- paste(combined$tagID, combined$dateTime, combined$site)
   combined <- combined[!duplicated(dup_key, fromLast = FALSE), , drop=FALSE]
 
@@ -803,7 +808,9 @@ server <- function(input, output, session) {
       }
     }
 
-    res <- compile_from_downloads(base, prev_df = baseline, mc_sites = c("CLE","KOCH","TAN","KCH"))
+      res <- compile_from_downloads(base, prev_df = baseline,
+                                    mc_sites = c("CLE","KOCH","TAN","KCH","LATMC"),
+                                    blocklist = bl_vec())
 
     if (!nrow(res$all_new)) {
       active_df(ensure_datetime(res$combined))
