@@ -141,7 +141,7 @@ derive_site_from_name <- function(path_or_name) {
   out <- ifelse(m > 0, regmatches(stem, m), "")
   toupper(out)
 }
-is_master_site <- function(site) site %in% c("LATMC","TAN","KOCH","KCH")
+is_master_site <- function(site) site %in% c("CLE","KOCH","TAN","KCH")
 
 best_time_parse <- function(x) {
   if (is.null(x)) return(as.POSIXct(character(0), tz="America/Los_Angeles"))
@@ -195,6 +195,9 @@ get_file_vec <- function(df) {
   }
 
   v <- pick("file")
+  if (!is.null(v)) out[is.na(out) | !nzchar(out)] <- v[is.na(out) | !nzchar(out)]
+
+  v <- pick("fileName")
   if (!is.null(v)) out[is.na(out) | !nzchar(out)] <- v[is.na(out) | !nzchar(out)]
 
   v <- pick("filename")
@@ -312,6 +315,117 @@ parse_srp_alarms_df <- function(file, display_name=NULL) {
   out <- data.frame(file=fname, site=site, dateTime=dt, A1=A[,1],A2=A[,2],A3=A[,3],A4=A[,4],A5=A[,5], stringsAsFactors=FALSE)
   out <- out[!is.na(out$dateTime), , drop=FALSE]
   out
+}
+
+# ========= Compile helpers (mirrors legacy script) =========
+align_compiled_columns <- function(df) {
+  desired <- c("Type","dateTime","tagID","duration","class","site","fileName","file","ukn","elapsed","strL","detYear","detMonth","detDay","ant","node")
+  missing <- setdiff(desired, names(df))
+  for (nm in missing) df[[nm]] <- NA
+  extra <- setdiff(names(df), desired)
+  df <- df[, c(desired, extra), drop=FALSE]
+  df
+}
+
+compile_from_downloads <- function(download_dir, prev_df=NULL, mc_sites=c("CLE","KOCH","TAN","KCH")) {
+  stopifnot(dir.exists(download_dir))
+
+  prev_df <- prev_df %||% data.frame()
+  prev_df <- ensure_datetime(prev_df)
+  prev_df <- align_compiled_columns(prev_df)
+
+  all_files <- dir(download_dir, full.names = FALSE)
+  all_files <- all_files[!tolower(all_files) %in% "desktop.ini"]
+
+  prev_files <- character(0)
+  if ("fileName" %in% names(prev_df)) prev_files <- as.character(prev_df$fileName)
+  if (!length(prev_files)) prev_files <- get_file_vec(prev_df)
+  prev_files <- unique(prev_files[!is.na(prev_files) & nzchar(prev_files)])
+
+  new_files <- all_files[!all_files %in% prev_files]
+
+  parts <- list(); idx <- 1L
+  for (i in seq_along(new_files)) {
+    f_name  <- new_files[i]
+    f_path  <- file.path(download_dir, f_name)
+    f_lines <- safe_read_lines(f_path)
+    tag_lines <- f_lines[nchar(f_lines) >= 5 & substr(f_lines, 2, 5) == "TAG:"]
+    if (!length(tag_lines)) next
+
+    site <- strsplit(f_name, "_")[[1]][1]
+    split_lines <- strsplit(tag_lines, " ")
+    dat_i <- data.frame(site = rep(site, length(split_lines)),
+                        dateTime = NA_character_,
+                        tagID = NA_character_,
+                        fileName = f_name,
+                        stringsAsFactors = FALSE)
+
+    if (site %in% mc_sites) {
+      for (j in seq_along(split_lines)) {
+        pj <- split_lines[[j]]
+        if (length(pj) >= 6) {
+          dat_i$site[j] <- paste0(site, "_", pj[3])
+          dat_i$dateTime[j] <- paste(pj[4], pj[5])
+          dat_i$tagID[j] <- pj[6]
+        }
+      }
+    } else {
+      for (j in seq_along(split_lines)) {
+        pj <- split_lines[[j]]
+        if (length(pj) >= 5) {
+          dat_i$dateTime[j] <- paste(pj[3], pj[4])
+          dat_i$tagID[j] <- pj[5]
+        }
+      }
+    }
+
+    parts[[idx]] <- dat_i
+    idx <- idx + 1L
+  }
+
+  if (!length(parts)) {
+    new_df <- align_compiled_columns(prev_df)
+    return(list(all_new = new_df[0, , drop=FALSE],
+                combined = prev_df,
+                new_files = character(0)))
+  }
+
+  all_raw <- do.call(rbind, parts)
+  all_new <- all_raw[!duplicated(all_raw[, c("site", "dateTime", "tagID")]), , drop=FALSE]
+  all_new$dateTime <- as.POSIXct(all_new$dateTime, "%m/%d/%Y %H:%M:%OS", tz = "America/Los_Angeles")
+
+  cutoff <- as.POSIXct(as.Date(Sys.time()) - (365 * 5), tz = "America/Los_Angeles")
+  all_new <- all_new[all_new$dateTime > cutoff, , drop=FALSE]
+  all_new <- all_new[!is.na(all_new$dateTime), , drop=FALSE]
+
+  all_new <- data.frame(
+    Type = "Biomark",
+    dateTime = all_new$dateTime,
+    tagID = as.character(all_new$tagID),
+    duration = NA,
+    class = NA,
+    site = all_new$site,
+    fileName = all_new$fileName,
+    file = all_new$fileName,
+    ukn = NA,
+    elapsed = NA,
+    strL = NA,
+    detYear = as.numeric(format(all_new$dateTime, "%Y")),
+    detMonth = as.numeric(format(all_new$dateTime, "%m")),
+    detDay = as.numeric(format(all_new$dateTime, "%j")),
+    ant = NA,
+    node = NA,
+    stringsAsFactors = FALSE
+  )
+
+  all_new <- align_compiled_columns(all_new)
+  prev_df <- align_compiled_columns(prev_df)
+
+  combined <- rbind(prev_df, all_new)
+  dup_key <- paste(combined$tagID, combined$dateTime, combined$site)
+  combined <- combined[!duplicated(dup_key, fromLast = FALSE), , drop=FALSE]
+
+  list(all_new = all_new, combined = combined, new_files = new_files)
 }
 
 # ========= PTAGIS link builder =========
@@ -569,9 +683,9 @@ server <- function(input, output, session) {
   list_compiled <- reactive({
     p <- paths(); if (is.null(p)) return(data.frame())
     if (!dir.exists(p$compiled_dir)) return(data.frame())
-    files <- list.files(p$compiled_dir, pattern="^allDets_with_BT&CT_tags_\\d{4}-\\d{2}-\\d{2}\\.rds$", full.names=TRUE)
+    files <- list.files(p$compiled_dir, pattern="^allDets_master_\\d{4}-\\d{2}-\\d{2}\\.rds$", full.names=TRUE)
     if (!length(files)) return(data.frame())
-    nm <- basename(files); stamp <- sub("^allDets_with_BT&CT_tags_(\\d{4}-\\d{2}-\\d{2})\\.rds$","\\1", nm)
+    nm <- basename(files); stamp <- sub("^allDets_master_(\\d{4}-\\d{2}-\\d{2})\\.rds$","\\1", nm)
     df <- data.frame(path=files, date=stamp, stringsAsFactors=FALSE)
     df[order(df$date, decreasing=TRUE), ]
   })
@@ -583,7 +697,7 @@ server <- function(input, output, session) {
   })
   output$compiled_picker_ui <- renderUI({
     df <- list_compiled()
-    if (!nrow(df)) return(helpText("No compiled files found (expects allDets_with_BT&CT_tags_YYYY-MM-DD.rds)."))
+    if (!nrow(df)) return(helpText("No compiled files found (expects allDets_master_YYYY-MM-DD.rds)."))
     choices <- stats::setNames(df$path, paste0(df$date, "  —  ", basename(df$path)))
     selectInput("compiled_pick", "Compiled RDS", choices=choices, selected=df$path[1], width="100%")
   })
@@ -649,128 +763,41 @@ server <- function(input, output, session) {
     showNotification(paste0("Loaded ", basename(pick), " (", format(nrow(dat), big.mark=","), " rows)."), type="message")
   })
   
-  # ----- Compile (append-only, recursive)
+  # ----- Compile (legacy-aligned, append-only)
   observeEvent(input$compile_btn, {
     p <- paths(); shiny::validate(shiny::need(!is.null(p), "Invalid profile"))
     base <- p$download_dir; shiny::validate(shiny::need(dir.exists(base), "Download directory not found"))
-    if (is.null(active_df())) {
-      auto <- newest_compiled_path()
-      if (nzchar(auto) && file.exists(auto)) {
-        dat0 <- tryCatch(readRDS(auto), error=function(e) NULL)
-        if (!is.null(dat0) && nrow(dat0)) { dat0 <- ensure_datetime(dat0); active_df(dat0)
-        showNotification(paste0("Auto-loaded base: ", basename(auto), " (", format(nrow(dat0), big.mark=","), " rows)."), type="message") }
-      }
-    }
-    files_all <- list.files(base, pattern="\\.txt$", full.names=TRUE, recursive=TRUE, ignore.case=TRUE)
-    shiny::validate(shiny::need(length(files_all)>0, "No .txt files found to compile"))
-    scanned_files(files_all)
-    
-    cur <- active_df()
-    already <- character(0)
 
-    # Pull baselines from the active dataset (if present)
-    if (!is.null(cur)) {
-      fv <- get_file_vec(cur)
-      if (length(fv)) {
-        already <- unique(tolower(fv[!is.na(fv) & nzchar(fv)]))
+    all_files <- dir(base, full.names = FALSE)
+    all_files <- all_files[!tolower(all_files) %in% "desktop.ini"]
+    shiny::validate(shiny::need(length(all_files) > 0, "No .txt files found to compile"))
+    scanned_files(file.path(base, all_files))
+
+    baseline <- active_df()
+    if (is.null(baseline)) {
+      pick <- input$compiled_pick %||% newest_compiled_path()
+      if (nzchar(pick) && file.exists(pick) && is_under_dir(pick, p$compiled_dir)) {
+        baseline <- tryCatch(readRDS(pick), error=function(e) NULL)
+        if (!is.null(baseline) && nrow(baseline)) {
+          baseline <- ensure_datetime(baseline)
+          showNotification(paste0("Loaded baseline: ", basename(pick), " (", format(nrow(baseline), big.mark=","), " rows)."), type="message")
+        }
       }
     }
 
-    # Union with persisted fingerprint (seen_files.rds)
-    seen0 <- seen_files_start()
-    if (length(seen0)) {
-      already <- unique(c(already, seen0))
+    res <- compile_from_downloads(base, prev_df = baseline, mc_sites = c("CLE","KOCH","TAN","KCH"))
+
+    if (!nrow(res$all_new)) {
+      active_df(ensure_datetime(res$combined))
+      new_files_ct(0)
+      showNotification("No new files found. Dataset unchanged.", type="message")
+      return()
     }
 
-    # Compute new files. Default uses basenames; switch to file_sig() if you want stricter match.
-    files_basenames <- tolower(basename(files_all))
-    files_new <- files_all[!(files_basenames %in% already)]
-
-    # Optional: strict signature match (uncomment to prefer size/hash-based signatures)
-    # sig_all <- vapply(files_all, file_sig, character(1))
-    # files_new <- files_all[!(sig_all %in% already)]
-
-    if (!length(files_new)) { new_files_ct(0); showNotification("No new files found. Dataset unchanged.", type="message"); return() }
-
-    withProgress(message=paste0("Parsing ", length(files_new), " new file(s)…"), value=0, {
-      parts <- vector("list", length(files_new))
-      for (i in seq_along(files_new)) {
-        fpath <- files_new[i]
-        parts[[i]] <- parse_one_file(fpath)
-        incProgress(i/length(files_new), detail = basename(fpath))
-      }
-      dat_new <- do.call(rbind, parts)
-    })
-    
-    bl <- bl_vec()
-    if (length(bl)) dat_new <- dat_new[!(dat_new$tagID %in% bl), , drop=FALSE]
-    
-    dat_new$dateTime <- best_time_parse(dat_new$dateTime)
-    ord <- order(dat_new$site, dat_new$file, dat_new$dateTime, dat_new$tagID)
-    dat_new <- dat_new[ord, ]
-    dup_key <- paste(dat_new$site, dat_new$dateTime, dat_new$tagID)
-    dat_new <- dat_new[!duplicated(dup_key), , drop=FALSE]
-    
-    dat_new$Type     <- "Biomark"
-    dat_new$duration <- NA; dat_new$class <- NA; dat_new$ukn <- NA; dat_new$elapsed <- NA; dat_new$strL <- NA
-    dat_new$detYear  <- as.numeric(format(dat_new$dateTime, "%Y"))
-    dat_new$detMonth <- as.numeric(format(dat_new$dateTime, "%m"))
-    dat_new$detDay   <- as.numeric(format(dat_new$dateTime, "%j"))
-    dat_new <- dat_new[,c("Type","dateTime","tagID","duration","class","site","node","file","ukn","elapsed","strL","detYear","detMonth","detDay")]
-    
-    dat_merge <- dat_new
-    
-    # Taglist merge
-    tlp <- input$taglist_pick %||% ""
-    if (nzchar(tlp) && file.exists(tlp) && is_under_dir(tlp, paths()$taglist_dir)) {
-      bt <- tryCatch(read.csv(tlp, stringsAsFactors=FALSE), error=function(e) NULL)
-      if (!is.null(bt) && nrow(bt)) {
-        keep_cols <- c('PIT.Tag','Stock','Event.Type','Organization','Event.Date','Brood.Year','Session',
-                       'Acoustic.Tag','Length.FL','Length.TL','Other.Tag',
-                       'Release.Site','Event.Site','Release.Site.Name','Event.Site.Name')
-        keep_cols <- keep_cols[keep_cols %in% names(bt)]
-        bt_sub <- bt[bt$Event.Type %in% c('MARK','Mark','mark'), keep_cols, drop=FALSE]
-        dat_merge <- merge(dat_merge, bt_sub, by.x="tagID", by.y="PIT.Tag", all.x=TRUE)
-      }
-    }
-    
-    cur <- active_df()
-    if (is.null(cur)) {
-      cur <- dat_merge
-    } else {
-      common <- union(names(cur), names(dat_merge))
-      for (nm in setdiff(common, names(cur)))       cur[[nm]] <- NA
-      for (nm in setdiff(common, names(dat_merge))) dat_merge[[nm]] <- NA
-      cur <- rbind(cur[,common], dat_merge[,common])
-      tag_col <- if ("tagID" %in% names(cur)) "tagID" else if ("TagID" %in% names(cur)) "TagID" else if ("PIT.Tag" %in% names(cur)) "PIT.Tag" else NULL
-      k <- paste(get_site_vec(cur), ensure_datetime(cur)$dateTime,
-                 if (!is.null(tag_col)) as.character(cur[[tag_col]]) else "")
-      cur <- cur[!duplicated(k), , drop=FALSE]
-    }
-    
-    active_df(cur <- ensure_datetime(cur))
-
-    # Persist updated fingerprint for future sessions
-    if (nrow(cur)) {
-      # By default, persist basenames present in the active dataset.
-      cur_seen <- unique(tolower(basename(get_file_vec(cur))))
-
-      # If you want to mark literally everything scanned this run as "seen", union with all basenames:
-      # cur_seen <- unique(c(cur_seen, tolower(basename(files_all))))
-
-      # Optional: use robust signatures instead of basenames
-      # cur_seen <- unique(vapply(files_all, file_sig, character(1)))
-
-      sp <- seen_cache_path()
-      if (nzchar(sp)) {
-        old <- seen_files_start()
-        new <- unique(c(old, cur_seen))
-        try(saveRDS(new, sp), silent = TRUE)
-      }
-    }
-
-    new_files_ct(length(files_new))
-    showNotification(paste0("Appended ", length(files_new), " new file(s). Active rows: ", format(nrow(cur), big.mark=","), "."), type="message")
+    cur <- ensure_datetime(res$combined)
+    active_df(cur)
+    new_files_ct(length(res$new_files))
+    showNotification(paste0("Appended ", length(res$new_files), " new file(s). Active rows: ", format(nrow(cur), big.mark=","), "."), type="message")
   })
   
   # ========= Upload Review (pre-commit modal) =========
@@ -1203,7 +1230,7 @@ server <- function(input, output, session) {
     shiny::validate(shiny::need(dir.exists(p$compiled_dir), "Compiled Data folder does not exist"))
     dat <- active_df(); shiny::validate(shiny::need(!is.null(dat) && nrow(dat)>0, "No active dataset to upload"))
     stamp <- format(Sys.Date(), "%Y-%m-%d")
-    f2 <- file.path(p$compiled_dir, sprintf("allDets_with_BT&CT_tags_%s.rds", stamp))
+    f2 <- file.path(p$compiled_dir, sprintf("allDets_master_%s.rds", stamp))
     ok <- tryCatch({ saveRDS(dat, f2); TRUE }, error=function(e) FALSE)
     if (ok) showNotification(paste0("Uploaded: ", f2), type="message", duration=6) else showNotification("Upload failed (could not save RDS).", type="error")
   })
