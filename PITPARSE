@@ -11,8 +11,9 @@
 # - Clearer “where it went” log after append (sheet name and row index).
 # - Taglist picker now recognizes both standard files such as
 #     allBT&CT_tags_2026-07.csv
-#   and experimental-cleaning files such as
-#     allBTCT_tags_2026-07_ExperimentalCleaning.csv
+#   and experimental-cleaning Excel files such as
+#     allBTCT_tags_2026-07_ExperimentalCleaning.xlsx
+# - CSV taglists are read with read.csv(); XLSX taglists are read with openxlsx.
 # - Keeps prior features (Upload Review, VTT/alarms, copy non-taglist tags, Fish/Sites/Files views, etc.).
 ########################################################################################################################
 
@@ -238,6 +239,79 @@ ensure_datetime <- function(df) {
     df$detDay   <- as.numeric(format(df$dateTime, "%j"))
   }
   df
+}
+
+# Read either a CSV or Excel taglist. For Excel workbooks, prefer the first
+# non-empty sheet containing a PIT.Tag-like column; otherwise use the first
+# non-empty sheet.
+read_taglist_file <- function(path) {
+  if (!is_nonempty_scalar_string(path) || !file.exists(path)) {
+    stop("Taglist file does not exist.")
+  }
+  
+  finish_taglist <- function(x) {
+    x <- as.data.frame(x, stringsAsFactors = FALSE)
+    names(x) <- make.names(trimws(names(x)), unique = TRUE)
+    required <- c("PIT.Tag", "Event.Type")
+    missing_required <- setdiff(required, names(x))
+    if (length(missing_required)) {
+      stop(paste0(
+        "Taglist is missing required column(s): ",
+        paste(missing_required, collapse = ", "),
+        "."
+      ))
+    }
+    x
+  }
+  
+  ext <- tolower(tools::file_ext(path))
+  
+  if (ext == "csv") {
+    return(finish_taglist(read.csv(
+      path,
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )))
+  }
+  
+  if (ext == "xlsx") {
+    if (!has_openxlsx) {
+      stop("Excel taglists require the R package 'openxlsx'. Run install.packages('openxlsx') once, then restart the app.")
+    }
+    
+    sheets <- openxlsx::getSheetNames(path)
+    if (!length(sheets)) stop("The Excel taglist has no readable worksheets.")
+    
+    sheet_data <- lapply(sheets, function(sheet_name) {
+      tryCatch(
+        openxlsx::read.xlsx(
+          path,
+          sheet = sheet_name,
+          check.names = FALSE,
+          detectDates = FALSE
+        ),
+        error = function(e) NULL
+      )
+    })
+    
+    nonempty <- which(vapply(
+      sheet_data,
+      function(x) !is.null(x) && nrow(x) > 0L && ncol(x) > 0L,
+      logical(1)
+    ))
+    if (!length(nonempty)) stop("The Excel taglist contains no readable data rows.")
+    
+    normalize_colname <- function(x) tolower(gsub("[^a-z0-9]", "", x))
+    has_pit_tag <- vapply(sheet_data, function(x) {
+      !is.null(x) && any(normalize_colname(names(x)) == "pittag")
+    }, logical(1))
+    
+    preferred <- which(has_pit_tag)
+    pick <- if (length(preferred)) preferred[1] else nonempty[1]
+    return(finish_taglist(sheet_data[[pick]]))
+  }
+  
+  stop("Unsupported taglist type. Use a .csv or .xlsx file.")
 }
 
 # ========= PARSERS =========
@@ -566,11 +640,11 @@ server <- function(input, output, session) {
     if (!dir.exists(p$taglist_dir)) return(data.frame())
     # Accept either of these taglist naming styles (case-insensitive):
     #   allBT&CT_tags_YYYY-MM.csv
-    #   allBTCT_tags_YYYY-MM_ExperimentalCleaning.csv
+    #   allBTCT_tags_YYYY-MM_ExperimentalCleaning.xlsx
     # The optional ExperimentalCleaning suffix is also allowed on the &CT style.
     taglist_pattern <- paste0(
       "^allBT(&CT|CT)_tags_[0-9]{4}-[0-9]{2}",
-      "(_ExperimentalCleaning)?[.]csv$"
+      "(_ExperimentalCleaning)?[.](csv|xlsx)$"
     )
     files <- list.files(
       p$taglist_dir,
@@ -604,11 +678,11 @@ server <- function(input, output, session) {
     if (!nrow(df)) return(helpText(
       paste(
         "No taglists found. Expected allBT&CT_tags_YYYY-MM.csv or",
-        "allBTCT_tags_YYYY-MM_ExperimentalCleaning.csv."
+        "allBTCT_tags_YYYY-MM_ExperimentalCleaning.xlsx."
       )
     ))
     choices <- stats::setNames(df$path, paste0(df$stamp, "  —  ", basename(df$path)))
-    selectInput("taglist_pick", "Taglist CSV", choices=choices, selected=df$path[1], width="100%")
+    selectInput("taglist_pick", "Taglist CSV / Excel", choices=choices, selected=df$path[1], width="100%")
   })
   output$compiled_picker_ui <- renderUI({
     df <- list_compiled()
@@ -752,7 +826,13 @@ server <- function(input, output, session) {
     # Taglist merge
     tlp <- input$taglist_pick %||% ""
     if (nzchar(tlp) && file.exists(tlp) && is_under_dir(tlp, paths()$taglist_dir)) {
-      bt <- tryCatch(read.csv(tlp, stringsAsFactors=FALSE), error=function(e) NULL)
+      bt <- tryCatch(
+        read_taglist_file(tlp),
+        error = function(e) {
+          showNotification(conditionMessage(e), type = "error", duration = 10)
+          NULL
+        }
+      )
       if (!is.null(bt) && nrow(bt)) {
         keep_cols <- c('PIT.Tag','Stock','Event.Type','Organization','Event.Date','Brood.Year','Session',
                        'Acoustic.Tag','Length.FL','Length.TL','Other.Tag',
@@ -806,7 +886,13 @@ server <- function(input, output, session) {
   build_upload_review <- function(src_paths, display_names, vt_vec, taglist_path=NULL, blocklist=character(0)) {
     tag_meta <- NULL
     if (is_nonempty_scalar_string(taglist_path) && file.exists(taglist_path)) {
-      tag_meta <- tryCatch(read.csv(taglist_path, stringsAsFactors=FALSE), error=function(e) NULL)
+      tag_meta <- tryCatch(
+        read_taglist_file(taglist_path),
+        error = function(e) {
+          showNotification(conditionMessage(e), type = "error", duration = 10)
+          NULL
+        }
+      )
       if (!is.null(tag_meta) && nrow(tag_meta)) tag_meta <- tag_meta[tag_meta$Event.Type %in% c('MARK','Mark','mark'), , drop=FALSE]
     }
     
